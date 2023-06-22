@@ -1,4 +1,4 @@
-Makefile linguist-detectable=false
+makefile linguist-detectable=false
 jobfile linguist-detectable=false
 mpol linguist-detectable=false
 .d linguist-detectable=false
