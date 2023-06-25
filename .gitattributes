@@ -1,4 +1,1 @@
-*akefile linguist-detectable=false
-jobfile linguist-detectable=false
-mpol linguist-detectable=false
-.d linguist-detectable=false
+*file linguist-detectable=false
