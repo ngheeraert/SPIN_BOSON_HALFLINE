@@ -164,16 +164,16 @@ CONTAINS
 
 
   ! --> Matrix muliplication
-  FUNCTION matmultiply_c(amat,bmat) RESULT(outmat)
+  !FUNCTION matmultiply_c(amat,bmat) RESULT(outmat)
 
-    complex(cx), dimension(:,:), intent(in)            :: amat
-    complex(cx), dimension(:,:), intent(in)            :: bmat
-    complex(cx), dimension(size(amat,1),size(bmat,2))  :: outmat
+  !  complex(cx), dimension(:,:), intent(in)            :: amat
+  !  complex(cx), dimension(:,:), intent(in)            :: bmat
+  !  complex(cx), dimension(:,:)  :: outmat
 
-    call zgemm ('N','N',size(amat,1),size(bmat,2),size(amat,2),one_r,amat,&
-         size(amat,1),bmat,size(bmat,1), zero_r,outmat,size(outmat,1))
+  !  call zgemm ('N','N',size(amat,1),size(bmat,2),size(amat,2),one_r,amat,&
+  !       size(amat,1),bmat,size(bmat,1), zero_r,outmat,size(outmat,1))
 
-  END FUNCTION matmultiply_c
+  !END FUNCTION matmultiply_c
 
   !-- Complex Matrix Multiplication
   FUNCTION matmultiply_c_rank22(A,B) RESULT(C)
