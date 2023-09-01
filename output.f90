@@ -390,7 +390,7 @@ CONTAINS
 		print*, "delta( Sx ) = ",SX2-SX1
 		print*, "delta( E ) = ",E2-E1
 		print*,"================================="
-		print*,
+		print*, " "
 
 	 END SUBROUTINE
 

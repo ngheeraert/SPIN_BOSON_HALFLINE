@@ -170,8 +170,8 @@ CONTAINS
     complex(cx), dimension(:,:), intent(in)            :: bmat
     complex(cx), dimension(size(amat,1),size(bmat,2))  :: outmat
 
-    call zgemm ('N','N',size(amat,1),size(bmat,2),size(amat,2),one,amat,&
-         size(amat,1),bmat,size(bmat,1), zero,outmat,size(outmat,1))
+    call zgemm ('N','N',size(amat,1),size(bmat,2),size(amat,2),one_r,amat,&
+         size(amat,1),bmat,size(bmat,1), zero_r,outmat,size(outmat,1))
 
   END FUNCTION matmultiply_c
 

@@ -119,12 +119,12 @@ CONTAINS
 		print*, '-tmax [00]','    		', 'Final time'
 		print*, '-wc [1000]','     	', 'Frequency cutoff'
 		print*, '-wmax [1]','      	', 'Maximum frequency (smooth cutoff)'
-		print*, 
+		print*, ' '
 	 	print*, '-- Polaron adding parameters ------------------------------'
 		print*, '-npadd [0]','     	', 'Number of coherent states to be added'
 		print*, '-tref [0.2]','	     	', 'Minimum time before adding additional CS'
 		print*, '-merr [10^-7]','	   ', 'Error threshold at which to add a CS'
-		print*, 
+		print*, ' '
 	 	print*, '-- State preparation parameters ----------------------------'
 		print*, '-prep [2]','			', '1=|down>+|up>, 2=|up>, 3=|down>'
 	 	print*, '========================================'
