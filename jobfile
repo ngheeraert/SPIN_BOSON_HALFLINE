@@ -1,10 +1,15 @@
-#!/bin/bash
-#PBS -S /bin/bash
-#PBS -o output.log
-#PBS -e err.log
-#PBS -u gheeraert
-#PBS -q long-serial
-#PBS -l walltime=1000:00:00
+#!/bin/bash 
+#PBS -o logfile.log 
+#PBS -e errorfile.err 
+#PBS -l walltime=168:00:00 
+#PBS -l select=1:ncpus=1
 
+tpdir=`echo $PBS_JOBID | cut -f 1 -d .`
+tempdir=$HOME/scratch/MPOL_$tpdir
+mkdir -p $tempdir
+cd $tempdir
+cp -R $PBS_O_WORKDIR/* .
 
+source /apps/intel/oneapi/setvars.sh
+source /apps/intel/oneapi/mkl/latest/env/vars.sh
 

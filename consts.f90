@@ -1,4 +1,11 @@
 module consts
+!==============================================================================
+! MODULE consts
+!
+! Shared numerical constants (pi, i, 0, 1) and a small allocation checker.
+! All physics is expressed in natural units (hbar = 1); c_light is unused here.
+!==============================================================================
+
 
   use typedefs 
   implicit none

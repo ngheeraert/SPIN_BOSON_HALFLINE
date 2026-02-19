@@ -1,4 +1,11 @@
   module typedefs
+!==============================================================================
+! MODULE typedefs
+!
+! Centralized kind definitions (single/double precision) for real and complex types.
+! Compile with -DDP to switch the whole codebase to double precision.
+!==============================================================================
+
   implicit none
   integer, parameter :: i1b=selected_int_kind(2)
   integer, parameter :: i2b=selected_int_kind(4)

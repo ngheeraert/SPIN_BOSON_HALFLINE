@@ -1,4 +1,12 @@
 MODULE lapackmodule
+!==============================================================================
+! MODULE lapackmodule
+!
+! Thin wrappers around a few LAPACK routines used in this project.
+! Provides matrix inversion and linear system solving for real/complex matrices,
+! and defines custom operators for matrix addition/product for readability.
+!==============================================================================
+
 
 USE typedefs, only : cx => c_type, rl=> r_type
 USE consts
@@ -18,6 +26,11 @@ implicit none
 CONTAINS
 
   ! --> Inverse of a Hermitian Positive Definite matrix
+!------------------------------------------------------------------------------
+! InvertHPD
+!   Invert a Hermitian positive definite matrix using Cholesky (ZPOTRF/ZPOTRI).
+!   Used when the variational metric is guaranteed HPD.
+!------------------------------------------------------------------------------
   SUBROUTINE InvertHPD(A)
 
     COMPLEX(8), intent(in out)                      ::  A(:,:)
@@ -49,6 +62,10 @@ CONTAINS
 
   END SUBROUTINE InvertHPD
 
+!------------------------------------------------------------------------------
+! InvertGeneral
+!   Invert a general complex matrix (ZGETRF/ZGETRI). Use with care (numerical stability).
+!------------------------------------------------------------------------------
   SUBROUTINE InvertGeneral(A,info)
     COMPLEX(cx), intent(in out)                  ::  A(:,:)
     integer, intent(out)								 ::  info
@@ -81,6 +98,10 @@ CONTAINS
   END SUBROUTINE InvertGeneral
 
   ! --> Inverse of a Hermitian Indefinite matrix
+!------------------------------------------------------------------------------
+! InvertH
+!   Invert a Hermitian (not necessarily positive) matrix via Bunch-Kaufman (ZHETRF/ZHETRI).
+!------------------------------------------------------------------------------
   SUBROUTINE InvertH(A,info)
     COMPLEX(cx), intent(in out)                  ::  A(:,:)
     integer, intent(out)								 ::  info
@@ -120,6 +141,10 @@ CONTAINS
   END SUBROUTINE InvertH
 
   ! --> Solve General Complex Equations
+!------------------------------------------------------------------------------
+! SolveEq_r
+!   Solve A x = b for real matrices using DGESV (LU + pivoting).
+!------------------------------------------------------------------------------
   SUBROUTINE SolveEq_r(A,B)
     REAL(rl), intent(in out)               ::  A(:,:)
 	 REAL(rl), intent(in out)					 ::  B(:)
@@ -140,6 +165,10 @@ CONTAINS
 	 end if
 
   END SUBROUTINE SolveEq_r
+!------------------------------------------------------------------------------
+! SolveEq_c
+!   Solve A x = b for complex matrices using ZGESV (LU + pivoting).
+!------------------------------------------------------------------------------
     SUBROUTINE SolveEq_c(A,B)
 
     COMPLEX(cx), intent(in out)               ::  A(:,:)
@@ -176,6 +205,10 @@ CONTAINS
   !END FUNCTION matmultiply_c
 
   !-- Complex Matrix Multiplication
+!------------------------------------------------------------------------------
+! matmultiply_*
+!   Thin zgemm/dgemm wrappers to express BLAS matrix products with Fortran arrays.
+!------------------------------------------------------------------------------
   FUNCTION matmultiply_c_rank22(A,B) RESULT(C)
 
     complex(cx), dimension(:,:), intent(in)            ::  A

@@ -1,10 +1,13 @@
+#F90 = ifx
 F90 = gfortran
+#LLAPACK  = -qmkl
 LLAPACK  = -lblas -llapack
 DEFS = -DDP 
 
-OPTFLAGS = -fall-intrinsics -O2 -fcheck=all #-Wall -Wtabs
+OPTFLAGS = -O2 
 FFLAGS  = -cpp $(DEFS) $(OPTFLAGS) $(MPFUN) $(MKLINCLUDE)
 LDFLAGS = $(OPTFLAGS) $(LLAPACK)
+
 
 ###### Section for developers
 

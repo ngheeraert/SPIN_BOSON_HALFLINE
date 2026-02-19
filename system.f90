@@ -1,4 +1,30 @@
 MODULE SYSTEM 
+!==============================================================================
+! MODULE SYSTEM
+!
+! Implements the time-dependent variational dynamics used in:
+!   N. Gheeraert et al., New J. Phys. 19 (2017) 023036.
+!
+! Physics model (spin-boson / waveguide QED):
+!   A two-level system with tunneling Delta (called `del` here) coupled to a continuum
+!   of bosonic modes (the 1D waveguide). In second-quantized form:
+!       H = (Delta/2) sigma_x + Sum_k omega_k a_k^dagger a_k + (sigma_z/2) Sum_k g_k (a_k + a_k^dagger)
+!   The code uses a linear discretization of omega_k up to `wmax`, with an exponential
+!   cutoff `wc` in the coupling.
+!
+! Variational ansatz (multi-coherent-state / multipolaron expansion):
+!   |Psi(t)> = Sum_{m=1}^{Ncs} [ p_m(t)|up>x|f_m(t)>  +  q_m(t)|down>x|h_m(t)> ]
+!   where |f_m> and |h_m> are multimode coherent states, parameterized by complex
+!   displacements f_{m,k} and h_{m,k}.
+!
+! Numerical method:
+!   - Precompute coherent-state overlaps and mode sums entering the energy functional.
+!   - Derive Euler-Lagrange equations via the time-dependent variational principle.
+!   - Convert the implicit equations (where dotf appears on both sides through kappa) into an
+!     explicit form by solving a linear system for kappa (Appendix of the paper). This keeps
+!     the cost scaling as O(Ncs^6) instead of O(Nmodes*Ncs^3).
+!==============================================================================
+
 
 	USE consts
 	USE lapackmodule
@@ -7,6 +33,9 @@ MODULE SYSTEM
 
 	IMPLICIT NONE 
 
+!------------------------------------------------------------------------------
+! Simulation / model parameters (grid, Hamiltonian parameters, run control).
+!------------------------------------------------------------------------------
 	TYPE param
 		integer    				 ::  npini
 		integer    				 ::  npadd
@@ -36,9 +65,17 @@ MODULE SYSTEM
 		integer						 ::  getWigner
 		real(rl)		 			 ::  max_deltaE
 		integer						 ::  prep
+		integer 					 :: verbose
 
 	END TYPE param
 
+!------------------------------------------------------------------------------
+! Variational state |Psi(t)> in multi-coherent-state form.
+!   - `np` is the current number of coherent states Ncs.
+!   - (p,f) describes the |up> branch, (q,h) the |down> branch.
+!   - Overlap and sum matrices are cached to avoid O(Nmodes) recomputation inside
+!     tight inner loops (energy, derivatives, observables).
+!------------------------------------------------------------------------------
 	TYPE STATE
 		real(rl)					 	::  t 								!-- Time
 		integer    				 	::  np
@@ -53,6 +90,9 @@ MODULE SYSTEM
 		complex(cx), allocatable  ::  bigL_f(:,:), bigL_h(:,:)  !-- Ls (as in the notes)
 	END TYPE STATE
 
+!------------------------------------------------------------------------------
+! Trajectory container: time series of monitored observables.
+!------------------------------------------------------------------------------
 	TYPE TRAJ
 		integer							::  i_time
 		real(rl), allocatable  	::  time_ar(:), energy_ar(:),  &
@@ -67,6 +107,14 @@ MODULE SYSTEM
 CONTAINS
 
 	!== initialize the parameters and get those in the command line
+!------------------------------------------------------------------------------
+! getParameters
+!   Parse command-line arguments and build the discretized bosonic bath:
+!     - omega_k: linear frequency grid (midpoint rule).
+!     - g_k: coupling chosen to reproduce an Ohmic spectral density with
+!            exponential cutoff, J(omega) proportional to alpha omega e^{-omega/omegac}.
+!   Also sets thresholds used by the adaptive 'add coherent state' strategy.
+!------------------------------------------------------------------------------
 	SUBROUTINE getParameters(sys)
 		type(param)           			  ::  sys
 		type(state)           	     	  ::  st
@@ -90,10 +138,11 @@ CONTAINS
 		sys%npini= 1
 		sys%npadd= 0
 		sys%p0 = IP_p
-		sys%merr = 0.0000001_rl
+		sys%merr = 0.000001_rl
 		sys%tref = 0.2_rl
 		sys%dt = 0.05_rl
 		sys%file_path = "data"
+		sys%verbose = 1
 
 		!-- for half-chain
 		sys%alpha = 0.1_rl
@@ -140,7 +189,7 @@ CONTAINS
 				else if(buffer=='-p0')then 
 					call get_command_argument(i+1, buffer)
 					read(buffer,*) sys%p0
-				else if(buffer=='-me')then
+				else if(buffer=='-merr')then
 					call get_command_argument(i+1, buffer)
 					read(buffer,*) sys%merr
 				elseif(buffer=='-npini')then 
@@ -182,6 +231,9 @@ CONTAINS
 				else if(buffer=='-getwig')then 
 					call get_command_argument(i+1, buffer)
 					read(buffer,*) sys%getWigner
+				else if(buffer=='-verbose')then 
+					call get_command_argument(i+1, buffer)
+					read(buffer,*) sys%verbose
 				else if(buffer=='-path')then 
 					call get_command_argument(i+1, buffer)
 					read(buffer,*) path_input
@@ -217,14 +269,25 @@ CONTAINS
 		end do
 
 		!-- define de coupling g(k)
+!       ! Coupling amplitudes g_k (discretized): chosen such that the bath spectral density
+!       ! matches an Ohmic form with exponential cutoff:
+!       !   J(omega) = pi Sum_k g_k^2 delta(omega-omega_k)  ->  2pialpha omega e^{-omega/omegac}.
+!       ! With a linear grid omega_k and spacing dk, this gives roughly g_k^2 proportional to alpha omega_k dk e^{-omega_k/omegac}.
 		sys%g(:) = sqrt( 2._rl*sys%alpha * sys%w(:) * sys%dk(:) * exp(-sys%w(:)/sys%wc) ) 
 
 		!-- system variables that depend on a possible input
+!       ! Real-space grid length for Fourier transforms (k-space <-> x-space):
+!       ! with constant dk, a periodic box length L approx pi/dk is used (convention of this code).
 		sys%length = pi/sys%dk1
 		sys%dx  = sys%length/sys%nmode
 	END SUBROUTINE  
 
 	!== Initialisation routines
+!------------------------------------------------------------------------------
+! allocate_state
+!   Allocate a `state` structure for Ncs coherent states and Nmodes bath modes.
+!   Called both at initialization and when a new coherent state (polaron) is added.
+!------------------------------------------------------------------------------
 	SUBROUTINE allocate_state(sys,st,npvalue)
 		type(param), intent(in)      	::  sys
 		type(state), intent(out)  		::  st
@@ -232,7 +295,9 @@ CONTAINS
 		integer, intent(in),optional		::  npvalue
 		integer									::  np, spinXYZ_dim, step_numb
 
-		print*, "-- BEGINNING ARRAYS ALLOCATION"
+		if (sys%verbose==1) then
+			print*, "-- BEGINNING ARRAYS ALLOCATION"
+		end if
 
 		if (present(npvalue)) then
 			tmpst%np = npvalue
@@ -278,19 +343,29 @@ CONTAINS
 
 		st = tmpst
 
-		print*, "-- ARRAYS ALLOCATED"
+		if (sys%verbose==1) then
+			print*, "-- ARRAYS ALLOCATED"
+		end if
+
 	END SUBROUTINE
 
+!------------------------------------------------------------------------------
+! allocate_trajectory
+!   Allocate arrays used to store the time evolution of observables (energy, norm,
+!   spin components, error estimator, ...).
+!------------------------------------------------------------------------------
 	SUBROUTINE allocate_trajectory(sys,tr)
 		type(param), intent(in)      	::  sys
 		type(traj), intent(out)      	::  tr
 		integer									::  step_numb
 
-		print*, "-- BEGINNING TRANJECTORY ALLOCATION"
+		if (sys%verbose==1) then
+			print*, "-- BEGINNING TRANJECTORY ALLOCATION"
+		end if
 
 		!spinXYZ_dim = (sys%tmax/sys%dt)*2._rl
 		!allocate(tmpst%spinXYZ(spinXYZ_dim,7))
-		step_numb = int( (sys%tmax / sys%dt)*1.1 ) 
+		step_numb = int( (sys%tmax / sys%dt)*1.5 ) 
 
 		allocate( tr%time_ar(step_numb) )
 		allocate( tr%error_ar(step_numb) )
@@ -309,9 +384,17 @@ CONTAINS
 		tr%spinXYZ_ar = 0._rl
 		tr%ps_ar = 0._rl
 
-		print*, "-- TRAJECTORY ALLOCATED"
+		if (sys%verbose==1) then
+			print*, "-- TRAJECTORY ALLOCATED"
+		end if
 	END SUBROUTINE
 
+!------------------------------------------------------------------------------
+! initialise_vaccum
+!   Build the initial variational state at time `time_in` with the bath in vacuum
+!   (all coherent displacements set to zero) and the spin prepared according to
+!   `sys%prep` (up, down, or superposition).
+!------------------------------------------------------------------------------
 	SUBROUTINE initialise_vaccum(sys,st,time_in)
 		type(param), intent(in)      	::  sys
 		type(state), intent(in out) 	 	::  st
@@ -326,25 +409,33 @@ CONTAINS
 			!-- preapre 1st excited state: up + down
 			st%p(1) = 1._rl/sqrt(2._rl)
 			st%q(1) = 1._rl/sqrt(2._rl)
-			print*, "=="
-			print*, "STATE PREPARED IN UP + DOWN"
-			print*, "=="
+			if (sys%verbose==1) then
+				print*, "=="
+				print*, "STATE PREPARED IN UP + DOWN"
+				print*, "=="
+			end if
 		else if ( (sys%prep == 2) ) then
 			!-- prepare in the up state
 			st%p(1) = 0.99999999999999_rl
 			st%q(1) = sqrt( 1._rl - conjg(st%p(1))*st%p(1) )
-			print*, "=="
-			print*, "STATE PREPARED IN UP"
-			print*, "=="
+			if (sys%verbose==1) then
+				print*, "=="
+				print*, "STATE PREPARED IN UP"
+				print*, "=="
+			end if
 		else if ( sys%prep == 3 ) then
 			!-- prepare in the up state
 			st%q(1) = 0.99999999999999_rl
 			st%p(1) = sqrt( 1._rl - conjg(st%q(1))*st%q(1) )
-			print*, "=="
-			print*, "STATE PREPARED IN DOWN"
-			print*, "=="
+			if (sys%verbose==1) then
+				print*, "=="
+				print*, "STATE PREPARED IN DOWN"
+				print*, "=="
+			end if
 		else 
-			print*, "Error in the value of prep"
+			if (sys%verbose==1) then
+				print*, "Error in the value of prep"
+			end if
 		end if
 
 		!-- updating the sums over k
@@ -359,7 +450,9 @@ CONTAINS
 		character(len=200)						::  fks_file,ps_file
 		real(rl)									::  f_r,f_i,h_r,h_i,p_r,q_r,p_i,q_i,a
 
-		print*, "Initialising from: ", parameterchar(sys)
+		if (sys%verbose==1) then
+			print*, "Initialising from: ", parameterchar(sys)
+		end if
 		fks_file="data/fks_fst_"//trim(adjustl(parameterchar(sys)))//".d"
 		ps_file="data/ps_fst_"//trim(adjustl(parameterchar(sys)))//".d"
 		open (unit=101,file=ps_file,action="read",status="old")
@@ -413,8 +506,8 @@ CONTAINS
 		write(p1iChar, '(f6.2)') sys%p1i
 		write(npinichar, '(i2)') sys%npini
 		write(npaddchar, '(i2)') sys%npadd
-		write(p0char, '(f6.3)') sys%p0*1000._rl
-		write(merrchar, '(f6.3)') sys%merr*1000000._rl
+		write(p0char, '(f10.8)') sys%p0
+		write(merrchar, '(f11.8)') sys%merr
 		write(nmChar, '(I5)') sys%nmode
 		write(tmaxchar, '(I10)') int(sys%tmax)
 		write(trefchar, '(f7.2)') sys%tref
@@ -440,6 +533,8 @@ CONTAINS
 			"_dt"//trim(adjustl(dtchar))//&
 			trim(adjustl(addchar))//&
 			"tmax"//trim(adjustl(tmaxchar))//&
+			"_wc"//trim(adjustl(wcchar))//&
+			"_wmax"//trim(adjustl(wmaxchar))//&
 			"_p"//trim(adjustl(prepchar))
 	END FUNCTION
 
@@ -472,269 +567,15 @@ CONTAINS
 	!=======================================
 	!== Calculation of the derivatives
 	!======================================
-
-	!-- Calculate the state derivatives form the st variables
-	SUBROUTINE calcDerivatives_OLD(sys,st) 
-		type(param), intent(in)                            		::  sys
-		type(state), intent(in out)	                      		::  st
-		complex(cx), dimension(st%np)							 		::  bigP, bigQ, v_p, v_q
-		complex(cx), dimension(st%np,sys%nmode)				 		::  bigF, bigH, v_f, v_h
-		complex(cx), dimension(st%np,st%np)              		::  M_p, M_q, M_pi, M_qi,N_p, N_q, N_pi, N_qi
-		complex(cx), dimension(st%np,st%np,st%np)       		::  A_p, A_q
-		complex(cx), dimension(st%np,st%np,st%np,sys%nmode)  ::  A_f, A_h
-		real(rl), dimension(2*st%np**2,2*st%np**2)   	 		::  EqMat_p, EqMat_q
-		real(rl), dimension(2*st%np**2)    		 			 		::  EqRhs_p, EqRhs_q, kappaVec_p, kappaVec_q
-		real(rl), dimension(st%np,st%np)	   				 		::  Kappa_p_r,Kappa_q_r,kappa_p_c,kappa_q_c
-		complex(cx), dimension(st%np,st%np)					 		::  Kappa_p,Kappa_q  !-- FINAL KAPPA MATRICES
-		complex(cx),dimension(st%np,sys%nmode)  			 		::  f,h,fc,hc  		
-		complex(cx),dimension(st%np)			   			 		::  p,q,pc,qc
-		complex(cx),dimension(st%np)			   			 		::  der_E_pc_save,der_E_qc_save
-		complex(cx),dimension(st%np,sys%nmode)			   	::  der_E_fc_save,der_E_hc_save
-		integer												          		::  i,j,k,l,m,cj,ii,jj,np,info,s
-
-		complex(cx), dimension(st%np) 				          		::  tmpV1_p,tmpV1_q,tmpV2_p,tmpV2_q
-		complex(cx), dimension(st%np,st%np,st%np,sys%nmode) 	::  tmpA_f1,tmpA_h1,tmpA_f2,tmpA_h2
-		complex(cx), dimension(st%np,sys%nmode) 				   ::  tmpV1_f,tmpV1_h
-		complex(cx), dimension(st%np,st%np,st%np,st%np)		::  D_f,D_h
-		complex(cx), dimension(st%np,st%np,st%np)				::  E_f,E_h
-		complex(cx), dimension(st%np,st%np)						::  K_f,K_h
-
-
-		!-- A few shortcuts
-		f=st%f;h=st%h;p=st%p;q=st%q
-		fc=conjg(f);hc=conjg(h);pc=conjg(p);qc=conjg(q)
-		np = st%np
-
-		!- set all variables to zero
-		bigP = 0._cx;bigQ = 0._cx;bigF = 0._cx;bigH = 0._cx
-		M_p=0._cx;M_q=0._cx;N_p=0._cx;N_q=0._cx
-		M_pi=0._cx;M_qi=0._cx;N_pi=0._cx;N_qi=0._cx
-		A_p=0._cx;A_q=0._cx;A_f=0._cx;A_h=0._cx
-		eqMat_p=0._cx;eqMat_q=0._cx;eqrhs_p=0._cx;eqrhs_q=0._cx
-		eqRhs_p = 0._cx;eqRhs_q = 0._cx
-		v_p=0._cx;v_q=0._cx;v_f=0._cx;v_h=0._cx
-		Kappa_p_r=0._cx;Kappa_q_r=0._cx;kappa_p_c=0._cx;kappa_q_c=0._cx
-		kappaVec_p=0._cx; kappaVec_q=0._cx;Kappa_p=0._cx;Kappa_q=0._cx
-		der_E_fc_save(:,:) = 0._cx
-		der_E_hc_save(:,:) = 0._cx
-		der_E_pc_save(:) = 0._cx
-		der_E_qc_save(:) = 0._cx
-		D_f = 0._cx;D_h = 0._cx
-		E_f = 0._cx;E_h = 0._cx
-		K_f = 0._cx;K_h = 0._cx
-
-		!==================================================
-		!-- STEP 1: Computation of A_p,A_q and v_p,v_q
-		!-- pDot(i) = sum_(j,k) [ A_p(i,j,k)*Kappa(k,j) + v_p(i) ] 
-		!-- qDot(i) = sum_(j,k) [ A_q(i,j,k)*Kappa(k,j) + v_q(i) ] 
-
-		do i=1,np
-			bigP(i) = P_j(sys,st,i)
-			bigQ(i) = Q_j(sys,st,i)
-			bigF(i,:) =  F_j(sys,st,i) 
-			bigH(i,:) =  H_j(sys,st,i) 
-		end do
-
-		!-- Matrix M: to be inverted
-		M_p = st%ov_ff
-		M_q = st%ov_hh
-
-		!-- perform the inversion
-		M_pi = M_p
-		M_qi = M_q
-		CALL invertH(M_pi,info)
-		CALL invertH(M_qi,info)
-
-		!-- Define v_p, v_q and A_p, A_q
-		v_p = M_pi .matprod. bigP
-		v_q = M_qi .matprod. bigQ
-
-		do i=1,size(A_p,1)
-			do j=1,size(A_p,2)
-				do k=1,size(A_p,3)
-					A_p(i,j,k) = 0.5_rl* M_pi(i,j) * st%ov_ff(j,k) * p(k)
-					A_q(i,j,k) = 0.5_rl* M_qi(i,j) * st%ov_hh(j,k) * q(k)
-				end do
-			end do
-		end do
-
-
-		!==================================================
-		!-- STEP 2: Computation of A_f,A_h and v_f,v_h
-		!-- fDot(i) = sum_(j,k) [ A_f(i,j,k)*Kappa(k,j) ] + v_f(i)  
-		!-- hDot(i) = sum_(j,k) [ A_h(i,j,k)*Kappa(k,j) ] + v_h(i)  
-
-		do j=1,np
-			do m=1,np
-				N_p(j,m) = p(m)*st%ov_ff(j,m)
-				N_q(j,m) = q(m)*st%ov_hh(j,m) 
-			end do
-		end do
-
-		!-- Calculate Nij and is inverse
-		N_pi = N_p
-		N_qi = N_q
-		CALL invertGeneral(N_pi,info)
-		CALL invertGeneral(N_qi,info)
-
-
-		!-- Computation of v_f and v_h (H_i in the notes)
-		tmpV1_f=0._cx
-		tmpV1_h=0._cx
-
-		!-- First term of v_f (and v_h)
-		tmpV1_f = bigF
-		tmpV1_h = bigH
-		!-- Second term of v_f
-		do s=1,sys%nmode
-			do j=1,np
-				tmpV1_f(j,s) = tmpV1_f(j,s) &
-					- sum( st%ov_ff(j,:)*v_p(:)*f(:,s) )
-				tmpV1_h(j,s) = tmpV1_h(j,s) &
-					- sum( st%ov_hh(j,:)*v_q(:)*h(:,s) )
-			end do
-			v_f(:,s) = N_pi .matprod. tmpV1_f(:,s)
-			v_h(:,s) = N_qi .matprod. tmpV1_h(:,s)
-		end do
-
-		tmpA_f1=0._cx; tmpA_h1=0._cx
-		tmpA_f2=0._cx; tmpA_h2=0._cx
-
-		!-- Defining the Betref matrices, here designated by A_f and A_h
-
-		do s=1,sys%nmode
-			do k=1,size(A_f,2)
-				do j=1,size(A_f,3)
-
-					do i=1,size(A_f,1)
-						tmpA_f1(i,j,k,s) = 0.5_rl* N_pi(i,j) * p(k)*f(k,s) * st%ov_ff(j,k)
-						tmpA_h1(i,j,k,s) = 0.5_rl* N_qi(i,j) * q(k)*h(k,s) * st%ov_hh(j,k)
-					end do
-
-					do l=1,np
-						tmpA_f2(l,j,k,s) = tmpA_f2(l,j,k,s) & 
-							- sum( A_p(:,j,k)*f(:,s)*st%ov_ff(l,:) )
-						tmpA_h2(l,j,k,s) = tmpA_h2(l,j,k,s) &
-							- sum( A_q(:,j,k)*h(:,s)*st%ov_hh(l,:) )
-					end do
-
-				end do
-
-
-				A_f(:,:,k,s) = tmpA_f1(:,:,k,s) + ( N_pi .matprod. tmpA_f2(:,:,k,s) )
-				A_h(:,:,k,s) = tmpA_h1(:,:,k,s) + ( N_qi .matprod. tmpA_h2(:,:,k,s) )
-
-			end do
-		end do
-
-		!==================================================
-		!-- STEP 3: Solve the system of equations for Kappa
-		!-- Define Q_ij, a 2*np**2 matrix: j in [1,np**2] correpsonds to Re(kappa)
-		!--    while j in [1+np**2,2*np**2] corresponds to Im(Kappa)
-
-		cj = st%np**2   !-- a shortcut to get to the imagainary part of kappaVec
-
-		do i=1,st%np
-			do j=1,st%np
-				K_f(i,j) = sum( conjg(f(i,:))*v_f(i,:) + f(i,:)*conjg(v_f(i,:)) - 2._rl*conjg(f(j,:))*v_f(i,:) )
-				K_h(i,j) = sum( conjg(h(i,:))*v_h(i,:) + h(i,:)*conjg(v_h(i,:)) - 2._rl*conjg(h(j,:))*v_h(i,:) )
-				do k=1,st%np
-					E_f(i,j,k) = sum( f(i,:)*conjg(A_f(i,j,k,:))  )
-					E_h(i,j,k) = sum( h(i,:)*conjg(A_h(i,j,k,:))  )
-					do m=1,st%np
-						D_f(i,m,j,k) = sum( (conjg(f(i,:)) - 2._rl*conjg(f(m,:)))*A_f(i,j,k,:) )
-						D_h(i,m,j,k) = sum( (conjg(h(i,:)) - 2._rl*conjg(h(m,:)))*A_h(i,j,k,:) )
-					end do
-				end do
-			end do
-		end do
-
-
-		do i=1, np
-			do m=1, np
-
-				ii = np*(i-1)+m
-
-				eqRhs_p(ii) 	  =  real( K_f(i,m) )
-				eqRhs_q(ii) 	  =  real( K_h(i,m) )
-				eqRhs_p(ii+cj)  =  aimag( K_f(i,m) )
-				eqRhs_q(ii+cj)  =  aimag( K_h(i,m) )
-
-				do j=1, np
-					do k=1, np
-
-						jj = np*(k-1) + j
-
-						eqMat_p(ii,jj) = kroneckerDelta(ii,jj) - real(  D_f(i,m,j,k) + E_f(i,j,k) )
-						eqMat_p(ii,jj+cj) = kroneckerDelta(ii,jj+cj) + aimag(  D_f(i,m,j,k) - E_f(i,j,k) )
-						eqMat_p(ii+cj,jj) = kroneckerDelta(ii+cj,jj) - aimag(  D_f(i,m,j,k) + E_f(i,j,k) )
-						eqMat_p(ii+cj,jj+cj) = kroneckerDelta(ii+cj,jj+cj) - real(  D_f(i,m,j,k) - E_f(i,j,k) )
-
-						eqMat_q(ii,jj) = kroneckerDelta(ii,jj) - real(  D_h(i,m,j,k) + E_h(i,j,k) )
-						eqMat_q(ii,jj+cj) = kroneckerDelta(ii,jj+cj) + aimag(  D_h(i,m,j,k) - E_h(i,j,k) )
-						eqMat_q(ii+cj,jj) = kroneckerDelta(ii+cj,jj) - aimag(  D_h(i,m,j,k) + E_h(i,j,k) )
-						eqMat_q(ii+cj,jj+cj) = kroneckerDelta(ii+cj,jj+cj) - real(  D_h(i,m,j,k) - E_h(i,j,k) )
-
-					end do
-				end do
-			end do
-		end do
-
-
-		!-- Apply the Lapack algorithm to solve the real system of equations
-		!-- the solution replaces the 2nd argument
-		kappaVec_p = eqRhs_p
-		CALL solveEq_r(eqMat_p,kappaVec_p)
-		kappaVec_q = eqRhs_q
-		CALL solveEq_r(eqMat_q,kappaVec_q)
-
-
-		! Convert the matrices to np*np matrix
-		kappa_p_r = transpose(reshape(kappaVec_p(1:np**2),(/np,np/)) )
-		kappa_p_c = transpose(reshape(kappaVec_p(1+np**2:2*np**2),(/np,np/)) )
-		kappa_q_r = transpose(reshape(kappaVec_q(1:np**2),(/np,np/)) )
-		kappa_q_c = transpose(reshape(kappaVec_q(1+np**2:2*np**2),(/np,np/)) )
-
-		kappa_p = kappa_p_r + Ic * kappa_p_c
-		kappa_q = kappa_q_r + Ic * kappa_q_c
-
-		!-- Compute the pdots and qdots
-		!-- pdot(i) = sum_j,k 0.5*M_pi(i,j)*ov(f(j),f(k))*p(k)*Kappa_p(k,j) + v_p(i)
-
-		tmpV1_p=0._rl;tmpV2_p=0._rl
-		tmpV1_q=0._rl;tmpV2_q=0._rl
-		do j=1,np
-			tmpV1_p(j)=tmpV1_p(j) + 0.5_rl*sum( p(:)*st%ov_ff(j,:)*Kappa_p(:,j) )
-			tmpV1_q(j)=tmpV1_q(j) + 0.5_rl*sum( q(:)*st%ov_hh(j,:)*Kappa_q(:,j) )
-		end do
-
-		tmpV2_p = M_pi .matprod. tmpV1_p
-		tmpV2_q = M_qi .matprod. tmpV1_q
-
-		st%pdot = tmpV2_p + v_p
-		st%qdot = tmpV2_q + v_q
-
-
-		!-- Compute the fdots and hdots
-		!-- fdot(i) = sum_j,k [ -N_pi(i,j)*p(k)*Kappa_p(k,j)*pc(j)*f(k)*ov(f(j),f(k)) 
-		!								+ sum_l,m [ -N_pi(i,l)*A_p(m,j,k)*Kappa_p(k,j)*pc(l)f(m)*ov(f(l),f(m)) ] ] + v_f(i)
-		tmpV1_f=0._cx
-		tmpV1_h=0._cx
-
-		do s=1, sys%nmode
-			do i=1,np
-				do j=1,np
-					tmpV1_f(i,s) = tmpV1_f(i,s) + sum( A_f(i,j,:,s) * Kappa_p(:,j) )
-					tmpV1_h(i,s) = tmpV1_h(i,s) + sum( A_h(i,j,:,s) * Kappa_q(:,j) )
-				end do
-			end do
-		end do
-
-		st%fdot = tmpV1_f + v_f
-		st%hdot = tmpV1_h + v_h
-	END SUBROUTINE calcDerivatives_OLD
-
-	!-- Calculate the state derivatives form the st variables with KRYLOV
+!------------------------------------------------------------------------------
+! CalcDerivatives(sys, st)
+!   Core routine: compute time derivatives (pdot,qdot,fdot,hdot) from the explicit
+!   variational equations of motion (TDVP).
+!
+!   The multi-coherent-state equations are implicit because kappa_{m,j} depends on dotf.
+!   Following the Appendix of the paper, the code builds a linear system for kappa and
+!   solves it (here via `directInverse`) to obtain an explicit dotf = F[v].
+!------------------------------------------------------------------------------
 	SUBROUTINE CalcDerivatives(sys,st)
 		type(param), intent(in)                         :: sys
 		type(state), intent(in out)                     :: st
@@ -754,13 +595,6 @@ CONTAINS
 		integer,save                                    :: counter
 		real(rl)                                        :: startTime, endTime
 
-
-		!print*, '-----------------------------------'
-		!print*, "fastCalcDerivatives used ! number : "
-		! print*, counter
-		! if (counter > 100000) then
-		!   stop "counter>100000 !"
-		! end if
 
 		!-- initialisations
 		!print*, 'initialisations'
@@ -947,6 +781,14 @@ CONTAINS
 
 	END FUNCTION
 
+!------------------------------------------------------------------------------
+! update_sums
+!   Recompute all cached overlap matrices and the 'big sums' over modes:
+!     ov_ff(m,n) = <f_m|f_n>,  ov_hh(m,n) = <h_m|h_n>, etc.
+!     bigW_f(m,n) = Sum_k omega_k f*_m,k f_n,k
+!     bigL_f(m,n) = Sum_k g_k (f*_m,k + f_n,k)
+!   These objects appear repeatedly in the variational equations and observables.
+!------------------------------------------------------------------------------
 	SUBROUTINE update_sums(sys,st)
 
 		type(param),intent(in)			::  sys
@@ -982,6 +824,12 @@ CONTAINS
 	!== State functions
 	!======================================
 
+!------------------------------------------------------------------------------
+! Energy(sys, st)
+!   Evaluate the variational energy functional E[Psi] = <Psi|H|Psi> using the cached
+!   overlaps and mode sums. This is the quantity whose gradients generate the
+!   Euler-Lagrange equations for (p,q,f,h).
+!------------------------------------------------------------------------------
 	FUNCTION Energy(sys,st)
 		type(param),intent(in)         				::  sys
 		type(state),intent(in)         				::  st
@@ -1007,7 +855,7 @@ CONTAINS
 			print*, "Error: Energy is complex"
 		end if
 
-		energy = real(tmp)
+		energy = real(tmp,KIND=8)
 
 	END FUNCTION
 	FUNCTION norm(st)
@@ -1040,26 +888,29 @@ CONTAINS
 		st%q = st%q/normval
 
 	END SUBROUTINE
-	FUNCTION error(sys,oost,ost,st)
+!------------------------------------------------------------------------------
+! error(sys, ost, st)
+!   Error estimator Err(t) used in the paper: squared norm of the auxiliary state
+!     |Phi(t)> = (i d/d_t - H) |Psi(t)>
+!   which vanishes for the exact Schrodinger dynamics. In practice, this provides a
+!   convergence / adaptivity criterion to decide whether to add a new coherent state.
+!------------------------------------------------------------------------------
+	FUNCTION error(sys,rost,st)
 
 		type(param),intent(in)		::  sys
-		type(state),intent(in) 	::  oost,ost,st
-		complex(cx)					::  tmp1,tmp2, tmp3, tmp4
-		complex(cx)	   			::  error
-		complex(cx), dimension(ost%np,sys%nmode)  ::  off, ohh, ofh, ohf,ofdd,ohdd
-		complex(cx), dimension(ost%np)  ::  opdd,oqdd
+		type(state),intent(in) 		::  rost,st
+		type(state) 				::  ost
+		complex(cx)					::  tmp1,tmp2, tmp3
+		complex(cx)	   				::  error
+		complex(cx), dimension(st%np,sys%nmode)  ::  off, ohh, ofh, ohf,ofdd,ohdd
 		integer					   	::  i,j
 
 		tmp1 = 0._cx
 		tmp2 = 0._cx
 		tmp3 = 0._cx
-		tmp4 = 0._cx
 		error = 0._cx
 
-		ofdd(:,:) = (st%fdot(:,:) - oost%fdot(:,:))/(st%t-oost%t)
-		ohdd(:,:) = (st%hdot(:,:) - oost%hdot(:,:))/(st%t-oost%t)
-		opdd(:) = (st%pdot(:) - oost%pdot(:))/(st%t-oost%t)
-		oqdd(:) = (st%qdot(:) - oost%qdot(:))/(st%t-oost%t)
+		ost = st
 
 		do i=1, size(st%f,1)
 			do j=1, size(ost%f,1)
@@ -1075,6 +926,7 @@ CONTAINS
 		do i=1,ost%np
 			do j=1,ost%np
 
+				!- - dot p  * dot p
 				tmp1 = tmp1 + ost%ov_ff(i,j)*( &
 					+ conjg(ost%pdot(i))*ost%pdot(j) - 0.5_rl*conjg(ost%pdot(i))*ost%p(j)*( conjg(off(j,j)) + off(j,j) - 2_rl*conjg(off(j,i)) )&
 					- 0.5_rl*conjg(ost%p(i))*ost%pdot(j)*( conjg(off(i,i)) + off(i,i) - 2_rl*off(i,j) ) &
@@ -1098,14 +950,14 @@ CONTAINS
 					- ost%bigL_f(i,j)*ost%bigW_f(i,j) ) &
 					+ sys%del*conjg(ost%p(i))*ost%q(j)*ost%ov_fh(i,j)*sum( sys%w(:)*conjg(ost%f(i,:))*ost%h(j,:) )
 
-				tmp4 = tmp4 + conjg(ost%p(j))*ost%ov_ff(j,i)*( &
-					+ opdd(i) &
-					- ost%pdot(i)*( off(i,i) + conjg(off(i,i)) - 2_rl*conjg(off(i,j)) ) &
-					- 0.5_rl*ost%p(i)*( sum( 2_rl*real(conjg(ofdd(i,:))*ost%f(i,:)) &
-					+ 2_rl*conjg(ost%fdot(i,:))*ost%fdot(i,:) &
-					- 2_rl*ofdd(i,:)*conjg(ost%f(j,:)) ) ) &
-					+ 0.25_rl*ost%p(i)*( off(i,i) + conjg(off(i,i)) - 2_rl*conjg(off(i,j)) )**2 &
-					)
+				!tmp4 = tmp4 + conjg(ost%p(j))*ost%ov_ff(j,i)*( &
+				!	+ opdd(i) &
+				!	- ost%pdot(i)*( off(i,i) + conjg(off(i,i)) - 2_rl*conjg(off(i,j)) ) &
+				!	- 0.5_rl*ost%p(i)*( sum( 2_rl*real(conjg(ofdd(i,:))*ost%f(i,:)) &
+				!	+ 2_rl*conjg(ost%fdot(i,:))*ost%fdot(i,:) &
+				!	- 2_rl*ofdd(i,:)*conjg(ost%f(j,:)) ) ) &
+				!	+ 0.25_rl*ost%p(i)*( off(i,i) + conjg(off(i,i)) - 2_rl*conjg(off(i,j)) )**2 &
+				!	)
 
 
 				!-- the q and h parts 
@@ -1133,23 +985,30 @@ CONTAINS
 					- (-ost%bigL_h(i,j))*ost%bigW_h(i,j) ) &
 					+ sys%del*conjg(ost%q(i))*ost%p(j)*ost%ov_hf(i,j)*sum( sys%w(:)*conjg(ost%h(i,:))*ost%f(j,:) )
 
-				tmp4 = tmp4 + conjg(ost%q(j))*ost%ov_hh(j,i)*( &
-					+ oqdd(i) &
-					- ost%qdot(i)*( ohh(i,i) + conjg(ohh(i,i)) - 2_rl*conjg(ohh(i,j)) ) &
-					- 0.5_rl*ost%q(i)*( sum( 2_rl*real(conjg(ohdd(i,:))*ost%h(i,:)) &
-					+ 2_rl*conjg(ost%hdot(i,:))*ost%hdot(i,:) &
-					- 2_rl*ohdd(i,:)*conjg(ost%h(j,:)) ) ) &
-					+ 0.25_rl*ost%q(i)*( ohh(i,i) + conjg(ohh(i,i)) - 2_rl*conjg(ohh(i,j)) )**2 &
-					)
+				!tmp4 = tmp4 + conjg(ost%q(j))*ost%ov_hh(j,i)*( &
+				!	+ oqdd(i) &
+				!	- ost%qdot(i)*( ohh(i,i) + conjg(ohh(i,i)) - 2_rl*conjg(ohh(i,j)) ) &
+				!	- 0.5_rl*ost%q(i)*( sum( 2_rl*real(conjg(ohdd(i,:))*ost%h(i,:)) &
+				!	+ 2_rl*conjg(ost%hdot(i,:))*ost%hdot(i,:) &
+				!	- 2_rl*ohdd(i,:)*conjg(ost%h(j,:)) ) ) &
+				!	+ 0.25_rl*ost%q(i)*( ohh(i,i) + conjg(ohh(i,i)) - 2_rl*conjg(ohh(i,j)) )**2 &
+				!	)
 
 			end do
 		end do
 
-		error =  -0.5_rl*real(tmp4) + 0.5_rl*tmp1 - 2._rl*aimag(tmp2) + tmp3
+		error =  tmp1 - 2._rl*aimag(tmp2) + tmp3
+		!error =  -0.5_rl*real(tmp4) + 0.5_rl*tmp1 - 2._rl*aimag(tmp2) + tmp3
 
 	END FUNCTION	
 
 	!-- Calculate the overlap between two coherent states
+!------------------------------------------------------------------------------
+! ov_states
+!   Coherent-state overlap(s): for multimode coherent states |alpha> and |beta>:
+!     <alpha|beta> = exp( -|alpha|^2/2 - |beta|^2/2 + alpha*.beta ).
+!   These overlaps define the metric on the variational manifold.
+!------------------------------------------------------------------------------
 	FUNCTION ov_states(st1,st2)
 
 		type(state), intent(in)  ::  st1,st2
@@ -1169,6 +1028,12 @@ CONTAINS
 		ov_states = tmp
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! ov_scalar
+!   Coherent-state overlap(s): for multimode coherent states |alpha> and |beta>:
+!     <alpha|beta> = exp( -|alpha|^2/2 - |beta|^2/2 + alpha*.beta ).
+!   These overlaps define the metric on the variational manifold.
+!------------------------------------------------------------------------------
 	FUNCTION ov_scalar(f1,f2)
 
 		complex(cx), intent(in) :: f1, f2
@@ -1182,6 +1047,12 @@ CONTAINS
 		ov_scalar = exp( -0.5_rl*tmp1 - 0.5_rl*tmp2 + tmp3 ) 
 
 	END FUNCTION	ov_scalar
+!------------------------------------------------------------------------------
+! ov
+!   Coherent-state overlap(s): for multimode coherent states |alpha> and |beta>:
+!     <alpha|beta> = exp( -|alpha|^2/2 - |beta|^2/2 + alpha*.beta ).
+!   These overlaps define the metric on the variational manifold.
+!------------------------------------------------------------------------------
 	FUNCTION ov(f1,f2)
 
 		complex(cx), intent(in) :: f1( : ), f2( : )
@@ -1241,6 +1112,10 @@ CONTAINS
 	END FUNCTION
 
 	!-- Expectation value of sigmaX
+!------------------------------------------------------------------------------
+! sigmaX(st)
+!   Spin expectation value computed with the non-orthogonal coherent-state basis.
+!------------------------------------------------------------------------------
 	FUNCTION sigmaX(st)
 
 		type(state), intent(in)  :: st
@@ -1260,6 +1135,10 @@ CONTAINS
 		sigmaX = real(tmp)
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! sigmaZ(st)
+!   Spin expectation value computed with the non-orthogonal coherent-state basis.
+!------------------------------------------------------------------------------
 	FUNCTION sigmaZ(st)
 
 		type(state), intent(in)  :: st
@@ -1269,6 +1148,10 @@ CONTAINS
 		sigmaZ = upProb(st) - downProb(st)
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! sigmaY(st)
+!   Spin expectation value computed with the non-orthogonal coherent-state basis.
+!------------------------------------------------------------------------------
 	FUNCTION sigmaY(st)
 
 		type(state), intent(in)  :: st
@@ -1295,6 +1178,12 @@ CONTAINS
 	!======================================================
 	!== HALF LINE FUNCITONS
 	!======================================================
+!------------------------------------------------------------------------------
+! f_nk_FT
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION f_nk_FT(sys,fnx,xmin,xmax)
 
 		type(param),intent(in)   						::  sys
@@ -1326,6 +1215,12 @@ CONTAINS
 
 	END FUNCTION
 
+!------------------------------------------------------------------------------
+! n_up_k
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION n_up_k(sys,st,i)
 
 		type(state), intent(in)   						::  st
@@ -1353,6 +1248,12 @@ CONTAINS
 		n_up_k = real( tmp )
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! n_up_x
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION n_up_x(sys,st,xmin,xmax)
 
 		type(state), intent(in)   						::  st
@@ -1394,6 +1295,12 @@ CONTAINS
 		n_up_x = real( tmp )
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! n_up
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION n_up(sys,st)
 
 		type(state), intent(in)   						::  st
@@ -1422,6 +1329,12 @@ CONTAINS
 
 	END FUNCTION
 
+!------------------------------------------------------------------------------
+! f_k
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION f_k(st,k)
 
 		type(state), intent(in)  ::  st
@@ -1437,6 +1350,12 @@ CONTAINS
 		end do
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! h_k
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION h_k(st,k)
 
 		type(state), intent(in)  ::  st
@@ -1453,6 +1372,12 @@ CONTAINS
 		end do
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! f_x
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION f_x(sys,st,x)
 
 		type(param), intent(in)  ::  sys
@@ -1467,6 +1392,12 @@ CONTAINS
 		end do
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! h_x
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION h_x(sys,st,x)
 
 		type(param), intent(in)  ::  sys
@@ -1481,6 +1412,12 @@ CONTAINS
 		end do
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! f_nx
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION f_nx(sys,st)
 
 		type(param),intent(in)   						::  sys
@@ -1499,6 +1436,12 @@ CONTAINS
 
 
 	END FUNCTION
+!------------------------------------------------------------------------------
+! h_nx
+!   Convenience observable: convert the coherent-state parameters into physical
+!   bath observables (k-space or x-space) such as photon density n(k), field envelope
+!   f(x), etc., for plotting the emitted wavepacket / cat state.
+!------------------------------------------------------------------------------
 	FUNCTION h_nx(sys,st)
 
 		type(param),intent(in)   						::  sys
@@ -1540,185 +1483,373 @@ CONTAINS
 
 END MODULE SYSTEM
 
-
+!	FUNCTION error_OLD(sys,oost,ost,st)
 !
-!  SUBROUTINE de_interpolate(sys,st)
+!		type(param),intent(in)		::  sys
+!		type(state),intent(in) 	::  oost,ost,st
+!		complex(cx)					::  tmp1,tmp2, tmp3, tmp4
+!		complex(cx)	   			::  error_OLD
+!		complex(cx), dimension(ost%np,sys%nmode)  ::  off, ohh, ofh, ohf,ofdd,ohdd
+!		complex(cx), dimension(ost%np)  ::  opdd,oqdd
+!		integer					   	::  i,j
 !
-!	 type(param),intent(in out)   ::  sys
-!	 type(state),intent(in out)   ::  st
-!	 type(param)				   	::  sys_dint
-!	 type(state)  				   	::  st_dint
-!	 integer								::  i, m, i_int, nmode1, nmode_rest
+!		tmp1 = 0._cx
+!		tmp2 = 0._cx
+!		tmp3 = 0._cx
+!		tmp4 = 0._cx
+!		error_OLD = 0._cx
 !
-!	 m = sys%dk_ratio
-!	 sys_dint = sys
+!		ofdd(:,:) = (st%fdot(:,:) - oost%fdot(:,:))/(st%t-oost%t)
+!		ohdd(:,:) = (st%hdot(:,:) - oost%hdot(:,:))/(st%t-oost%t)
+!		opdd(:) = (st%pdot(:) - oost%pdot(:))/(st%t-oost%t)
+!		oqdd(:) = (st%qdot(:) - oost%qdot(:))/(st%t-oost%t)
 !
-!	 sys_dint%nmode = sys%nmode1 + (sys%nmode-sys%nmode1)/m
-!	 nmode_rest = sys%nmode - sys%nmode1 - ((sys%nmode-sys%nmode1)/m)*m
-!	 print*,"NMODE_REST=",nmode_rest
-!
-!	 deallocate(sys_dint%w)
-!	 deallocate(sys_dint%dk)
-!	 deallocate(sys_dint%g)
-!	 allocate(sys_dint%w(sys_dint%nmode))
-!	 allocate(sys_dint%dk(sys_dint%nmode))
-!	 allocate(sys_dint%g(sys_dint%nmode))
-!
-!	 CALL allocate_state(sys_dint,st_dint,st%np)
-!	 st_dint%p = st%p
-!	 st_dint%q = st%q
-!	 st_dint%t = st%t
-!
-!	 !-- the first nmode1 terms are indentical
-!	 sys_dint%w(1:sys%nmode1) = sys%w(1:sys%nmode1)
-!	 sys_dint%dk(1:sys%nmode1) = sys%dk(1:sys%nmode1)
-!	 sys_dint%g(1:sys%nmode1) = sys%g(1:sys%nmode1)
-!	 st_dint%f(:,1:sys%nmode1) = st%f(:,1:sys%nmode1)
-!	 st_dint%fo(:,1:sys%nmode1) = st%fo(:,1:sys%nmode1)
-!	 st_dint%h(:,1:sys%nmode1) = st%h(:,1:sys%nmode1)
-!	 st_dint%ho(:,1:sys%nmode1) = st%ho(:,1:sys%nmode1)
-!
-!	 !-- for the first de_interpollation, just move in the array by 1/2 of the
-!	 !			new dk
-!	 sys_dint%w(sys%nmode1+1) = sys%w(sys%nmode1+(m+1)/2)
-!	 sys_dint%dk(sys%nmode1+1) = sys%dk(sys%nmode1+(m+1)/2)*m
-!	 sys_dint%g(sys%nmode1+1) = sys%g(sys%nmode1+(m+1)/2)*sqrt(dble(m))
-!	 st_dint%f(:,sys%nmode1+1) = st%f(:,sys%nmode1+(m+1)/2)*sqrt(dble(m))
-!	 st_dint%fo(:,sys%nmode1+1) = st%fo(:,sys%nmode1+(m+1)/2)*sqrt(dble(m))
-!	 st_dint%h(:,sys%nmode1+1) = st%h(:,sys%nmode1+(m+1)/2)*sqrt(dble(m))
-!	 st_dint%ho(:,sys%nmode1+1) = st%ho(:,sys%nmode1+(m+1)/2)*sqrt(dble(m))
-!
-!	 !-- now move by dk, except the last
-!	 do i=1, sys_dint%nmode  -sys%nmode1 -1 -1
-!	 	i_int = sys%nmode1+(m+1)/2+m*i
-!	   sys_dint%w(sys%nmode1+1+i) = sys%w(i_int)
-!	   sys_dint%dk(sys%nmode1+1+i) = sys%dk(i_int)*m
-!	   sys_dint%g(sys%nmode1+1+i) = sys%g(i_int)*sqrt(dble(m))
-!	   st_dint%f(:,sys%nmode1+1+i) = st%f(:,i_int)*sqrt(dble(m))
-!	   st_dint%fo(:,sys%nmode1+1+i) = st%fo(:,i_int)*sqrt(dble(m))
-!	   st_dint%h(:,sys%nmode1+1+i) = st%h(:,i_int)*sqrt(dble(m))
-!	   st_dint%ho(:,sys%nmode1+1+i) = st%ho(:,i_int)*sqrt(dble(m))
-!	 end do
-!
-!	 !-- int the last we need to incorporate the modes that are left: nmode_rest
-!	 i=sys_dint%nmode  -sys%nmode1 -1
-!	 i_int = sys%nmode1+(m+1)/2+m*i
-!	 sys_dint%w(sys_dint%nmode) = sys%w(i_int)
-!	 sys_dint%dk(sys_dint%nmode) = sys%dk(i_int)*(m+nmode_rest)
-!	 sys_dint%g(sys_dint%nmode) = sys%g(i_int)*sqrt(dble(m+nmode_rest))
-!	 st_dint%f(:,sys_dint%nmode) = st%f(:,i_int)*sqrt(dble(m+nmode_rest))
-!	 st_dint%fo(:,sys_dint%nmode) = st%fo(:,i_int)*sqrt(dble(m+nmode_rest))
-!	 st_dint%h(:,sys_dint%nmode) = st%h(:,i_int)*sqrt(dble(m+nmode_rest))
-!	 st_dint%ho(:,sys_dint%nmode) = st%ho(:,i_int)*sqrt(dble(m+nmode_rest))
-!
-!
-!	 CALL update_sums(sys_dint,st_dint)
-!	 CALL normalise(st_dint)
-!
-!	 print*,"ARRAYS DE-INTERPOLATED"
-!	 print*,"-- number of modes =", sys%nmode1 ," / ", sys_dint%nmode - sys%nmode1
-!	 print*,"-- dk =", sys%dk(1) ," / ", sys_dint%dk(sys%nmode1+1)
-!
-!	 sys = sys_dint
-!	 st = st_dint
-!
-!  END SUBROUTINE
-!  SUBROUTINE interpolate(sys,st,st_int)
-!
-!	 type(param),intent(in)   		::  sys
-!	 type(state),intent(in)    	::  st
-!	 type(state),intent(in out)   ::  st_int
-!	 integer								::  i, j, m, i_int
-!
-!	 m = sys%dk_ratio
-!
-!	 CALL allocate_state(sys,st_int,st%np)
-!
-!	 st_int%p = st%p
-!	 st_int%q = st%q
-!	 st_int%t = st%t
-!
-!	 !-- first part of the arrays is the same
-!	 st_int%f(:,1:sys%nmode1) = st%f(:,1:sys%nmode1)
-!	 st_int%fo(:,1:sys%nmode1) = st%fo(:,1:sys%nmode1)
-!	 st_int%h(:,1:sys%nmode1) = st%h(:,1:sys%nmode1)
-!	 st_int%ho(:,1:sys%nmode1) = st%ho(:,1:sys%nmode1)
-!
-!	 !-- first point to be interpollated
-!	 st_int%f(:,sys%nmode1+(m+1)/2) = st%f(:,sys%nmode1+1)
-!	 st_int%fo(:,sys%nmode1+(m+1)/2) = st%fo(:,sys%nmode1+1)
-!	 st_int%h(:,sys%nmode1+(m+1)/2) = st%h(:,sys%nmode1+1)
-!	 st_int%ho(:,sys%nmode1+(m+1)/2) = st%ho(:,sys%nmode1+1)
-!
-!	 i_int = sys%nmode1+(m+1)/2
-!	 do j=1,(m-1)/2
-!
-!		st_int%f(:,i_int-j) = st%f(:,sys%nmode1+1) &
-!			 + (st%f(:,sys%nmode1)*sqrt(dble(m)) - st%f(:,sys%nmode1+1))*dble(j)/dble( (m-1)/2+1 )
-!		st_int%fo(:,i_int-j) = st%fo(:,sys%nmode1+1) &
-!			 + (st%fo(:,sys%nmode1)*sqrt(dble(m)) - st%fo(:,sys%nmode1+1))*dble(j)/dble( (m-1)/2+1 )
-!		st_int%h(:,i_int-j) = st%h(:,sys%nmode1+1) &
-!			 + (st%h(:,sys%nmode1)*sqrt(dble(m)) - st%h(:,sys%nmode1+1))*dble(j)/dble( (m-1)/2+1 )
-!		st_int%ho(:,i_int-j) = st%ho(:,sys%nmode1+1) &
-!			 + (st%ho(:,sys%nmode1)*sqrt(dble(m)) - st%ho(:,sys%nmode1+1))*dble(j)/dble( (m-1)/2+1 )
-!
-!	 end do
-!
-!	 !-- interpollate all the middle terms except the lst of the input array
-!	 do i=1, size(st%f,2) - sys%nmode1-1 -1
-!
-!	 	i_int = sys%nmode1+(m+1)/2+m*i
-!	   st_int%f(:,i_int) = st%f(:,sys%nmode1+1+i) 
-!	   st_int%fo(:,i_int) = st%fo(:,sys%nmode1+1+i)
-!	   st_int%h(:,i_int) = st%h(:,sys%nmode1+1+i)
-!	   st_int%ho(:,i_int) = st%ho(:,sys%nmode1+1+i)
-!
-!		do j=1,m-1
-!
-!		  st_int%f(:,i_int-j) = st%f(:,sys%nmode1+1+i) &
-!						  + (st%f(:,sys%nmode1+i) - st%f(:,sys%nmode1+i+1))*dble(j)/dble(m)
-!		  st_int%fo(:,i_int-j) = st%fo(:,sys%nmode1+1+i) &
-!						  + (st%fo(:,sys%nmode1+i) - st%fo(:,sys%nmode1+i+1))*dble(j)/dble(m)
-!		  st_int%h(:,i_int-j) = st%h(:,sys%nmode1+1+i) &
-!						  + (st%h(:,sys%nmode1+i) - st%h(:,sys%nmode1+i+1))*dble(j)/dble(m)
-!		  st_int%ho(:,i_int-j) = st%ho(:,sys%nmode1+1+i) &
-!						  + (st%ho(:,sys%nmode1+i) - st%ho(:,sys%nmode1+i+1))*dble(j)/dble(m)
-!
+!		do i=1, size(st%f,1)
+!			do j=1, size(ost%f,1)
+!				off(i,j) = dot_product( ost%fdot(i,:) , ost%f(j,:) )
+!				ohh(i,j) = dot_product( ost%hdot(i,:) , ost%h(j,:) )
+!				ofh(i,j) = dot_product( ost%fdot(i,:) , ost%h(j,:) )
+!				ohf(i,j) = dot_product( ost%hdot(i,:) , ost%f(j,:) )
+!			end do
 !		end do
 !
-!	 end do
+!		tmp3 = tmp3 + 0.25_rl*sys%del**2 + 0.25_rl*sum(sys%g(:)*sys%g(:))
 !
-!	 !-- last interpollation
-!	 i = size(st%f,2) - sys%nmode1 -1-1
-!	 i_int = sys%nmode1+(m+1)/2+m*i
-!	 do j=1,size(st_int%f,2)-i_int
+!		do i=1,ost%np
+!			do j=1,ost%np
 !
-!		st_int%f(:,i_int+j) = st_int%f(:,i_int) + (st_int%f(:,i_int) - st_int%f(:,i_int-1))*j
-!		st_int%fo(:,i_int+j) = st_int%fo(:,i_int) + (st_int%fo(:,i_int) - st_int%fo(:,i_int+1))*j
-!		st_int%h(:,i_int+j) = st_int%h(:,i_int) + (st_int%h(:,i_int) - st_int%h(:,i_int-1))*j
-!		st_int%ho(:,i_int+j) = st_int%ho(:,i_int) + (st_int%ho(:,i_int) - st_int%ho(:,i_int-1))*j
+!				tmp1 = tmp1 + ost%ov_ff(i,j)*( &
+!					+ conjg(ost%pdot(i))*ost%pdot(j) - 0.5_rl*conjg(ost%pdot(i))*ost%p(j)*( conjg(off(j,j)) + off(j,j) - 2_rl*conjg(off(j,i)) )&
+!					- 0.5_rl*conjg(ost%p(i))*ost%pdot(j)*( conjg(off(i,i)) + off(i,i) - 2_rl*off(i,j) ) &
+!					+ 0.25_rl*conjg(ost%p(i))*ost%p(j)*( (conjg(off(i,i))+off(i,i))*( conjg(off(j,j)) + off(j,j) - 2_rl*conjg(off(j,i))) &
+!					- 2_rl*off(i,j)*( conjg(off(j,j)) + off(j,j) ) &
+!					+ 4_rl*( off(i,j)*conjg(off(j,i)) + sum(conjg(ost%fdot(i,:))*ost%fdot(j,:)) ) ) )
 !
-!	 end do
+!				tmp2 = tmp2 + ost%ov_ff(i,j)*ost%p(j)* ( &
+!					( conjg(ost%pdot(i)) - 0.5_rl*conjg(ost%p(i))*(conjg(off(i,i)) + off(i,i)) )*( ost%bigW_f(i,j) &
+!					- 0.5_rl*ost%bigL_f(i,j) ) &
+!					+ conjg(ost%p(i))*off(i,j)*( ost%bigW_f(i,j) - 0.5_rl*ost%bigL_f(i,j) ) &
+!					+ conjg(ost%p(i))*sum( sys%w(:)*conjg(ost%fdot(i,:))*ost%f(j,:) - 0.5_rl*conjg(ost%fdot(i,:))*sys%g(:)) ) &
+!					+ 0.5_rl*sys%del*ost%q(j)*ost%ov_fh(i,j)*( conjg(ost%pdot(i)) & 
+!					- 0.5_rl*conjg(ost%p(i))*( conjg(off(i,i)) + off(i,i) - 2_rl*ofh(i,j) ) )
 !
-!	 st_int%f(:,sys%nmode1+1:) = st_int%f(:,sys%nmode1+1:)/sqrt(dble(m))
-!	 st_int%fo(:,sys%nmode1+1:) = st_int%fo(:,sys%nmode1+1:)/sqrt(dble(m))
-!	 st_int%h(:,sys%nmode1+1:) = st_int%h(:,sys%nmode1+1:)/sqrt(dble(m))
-!	 st_int%ho(:,sys%nmode1+1:) = st_int%ho(:,sys%nmode1+1:)/sqrt(dble(m))
 !
-!	 CALL update_sums(sys,st_int)
-!	 CALL normalise(st_int)
+!				tmp3 = tmp3 + conjg(ost%p(i))*ost%p(j)*ost%ov_ff(i,j)*( sum( sys%w(:)*sys%w(:)*conjg(ost%f(i,:))*ost%f(j,:) ) &
+!					+ (ost%bigW_f(i,j))**2 &
+!					+ 0.25_rl*(ost%bigL_f(i,j))**2 &
+!					- 0.5_rl*sum( sys%g(:)*sys%w(:)*(conjg(ost%f(i,:)) + ost%f(j,:)) ) &
+!					- ost%bigL_f(i,j)*ost%bigW_f(i,j) ) &
+!					+ sys%del*conjg(ost%p(i))*ost%q(j)*ost%ov_fh(i,j)*sum( sys%w(:)*conjg(ost%f(i,:))*ost%h(j,:) )
 !
-!	 print*,"ARRAYS INTERPOLATED"
+!				tmp4 = tmp4 + conjg(ost%p(j))*ost%ov_ff(j,i)*( &
+!					+ opdd(i) &
+!					- ost%pdot(i)*( off(i,i) + conjg(off(i,i)) - 2_rl*conjg(off(i,j)) ) &
+!					- 0.5_rl*ost%p(i)*( sum( 2_rl*real(conjg(ofdd(i,:))*ost%f(i,:)) &
+!					+ 2_rl*conjg(ost%fdot(i,:))*ost%fdot(i,:) &
+!					- 2_rl*ofdd(i,:)*conjg(ost%f(j,:)) ) ) &
+!					+ 0.25_rl*ost%p(i)*( off(i,i) + conjg(off(i,i)) - 2_rl*conjg(off(i,j)) )**2 &
+!					)
 !
-!  END SUBROUTINE
 !
+!				!-- the q and h parts 
+!
+!				tmp1 = tmp1 + ost%ov_hh(i,j)*( &
+!					+ conjg(ost%qdot(i))*ost%qdot(j) - 0.5_rl*conjg(ost%qdot(i))*ost%q(j)*( conjg(ohh(j,j)) + ohh(j,j) - 2_rl*conjg(ohh(j,i)) )&
+!					- 0.5_rl*conjg(ost%q(i))*ost%qdot(j)*( conjg(ohh(i,i)) + ohh(i,i) - 2_rl*ohh(i,j) ) &
+!					+ 0.25_rl*conjg(ost%q(i))*ost%q(j)*( (conjg(ohh(i,i))+ohh(i,i))*( conjg(ohh(j,j)) + ohh(j,j) - 2_rl*conjg(ohh(j,i))) &
+!					- 2_rl*ohh(i,j)*( conjg(ohh(j,j)) + ohh(j,j) ) &
+!					+ 4_rl*( ohh(i,j)*conjg(ohh(j,i)) + sum(conjg(ost%hdot(i,:))*ost%hdot(j,:)) ) ) )
+!
+!
+!				tmp2 = tmp2 + ost%ov_hh(i,j)*ost%q(j)* ( &
+!					( conjg(ost%qdot(i)) - 0.5_rl*conjg(ost%q(i))*(conjg(ohh(i,i)) + ohh(i,i)) )*( ost%bigW_h(i,j) &
+!					- 0.5_rl*(-ost%bigL_h(i,j)) ) &
+!					+ conjg(ost%q(i))*ohh(i,j)*( ost%bigW_h(i,j) - 0.5_rl*(-ost%bigL_h(i,j)) ) &
+!					+ conjg(ost%q(i))*sum( sys%w(:)*conjg(ost%hdot(i,:))*ost%h(j,:) - 0.5_rl*conjg(ost%hdot(i,:))*(-sys%g(:)) ) ) &
+!					+ 0.5_rl*sys%del*ost%p(j)*ost%ov_hf(i,j)*( conjg(ost%qdot(i)) & 
+!					- 0.5_rl*conjg(ost%q(i))*( conjg(ohh(i,i)) + ohh(i,i) - 2_rl*ohf(i,j) ) )
+!
+!				tmp3 = tmp3 + conjg(ost%q(i))*ost%q(j)*ost%ov_hh(i,j)*( sum( sys%w(:)*sys%w(:)*conjg(ost%h(i,:))*ost%h(j,:) ) &
+!					+ (ost%bigW_h(i,j))**2 &
+!					+ 0.25_rl*(-ost%bigL_h(i,j))**2 &
+!					- 0.5_rl*sum( (-sys%g(:))*sys%w(:)*(conjg(ost%h(i,:)) + ost%h(j,:)) ) &
+!					- (-ost%bigL_h(i,j))*ost%bigW_h(i,j) ) &
+!					+ sys%del*conjg(ost%q(i))*ost%p(j)*ost%ov_hf(i,j)*sum( sys%w(:)*conjg(ost%h(i,:))*ost%f(j,:) )
+!
+!				tmp4 = tmp4 + conjg(ost%q(j))*ost%ov_hh(j,i)*( &
+!					+ oqdd(i) &
+!					- ost%qdot(i)*( ohh(i,i) + conjg(ohh(i,i)) - 2_rl*conjg(ohh(i,j)) ) &
+!					- 0.5_rl*ost%q(i)*( sum( 2_rl*real(conjg(ohdd(i,:))*ost%h(i,:)) &
+!					+ 2_rl*conjg(ost%hdot(i,:))*ost%hdot(i,:) &
+!					- 2_rl*ohdd(i,:)*conjg(ost%h(j,:)) ) ) &
+!					+ 0.25_rl*ost%q(i)*( ohh(i,i) + conjg(ohh(i,i)) - 2_rl*conjg(ohh(i,j)) )**2 &
+!					)
+!
+!			end do
+!		end do
+!
+!		error_OLD =  -0.5_rl*real(tmp4) + 0.5_rl*tmp1 - 2._rl*aimag(tmp2) + tmp3
+!
+!	END FUNCTION	
 
-
-
-
-
-
-
-
-
-
+!
+!	!-- Calculate the state derivatives form the st variables
+!	SUBROUTINE calcDerivatives_OLD(sys,st) 
+!		type(param), intent(in)                            		::  sys
+!		type(state), intent(in out)	                      		::  st
+!		complex(cx), dimension(st%np)							 		::  bigP, bigQ, v_p, v_q
+!		complex(cx), dimension(st%np,sys%nmode)				 		::  bigF, bigH, v_f, v_h
+!		complex(cx), dimension(st%np,st%np)              		::  M_p, M_q, M_pi, M_qi,N_p, N_q, N_pi, N_qi
+!		complex(cx), dimension(st%np,st%np,st%np)       		::  A_p, A_q
+!		complex(cx), dimension(st%np,st%np,st%np,sys%nmode)  ::  A_f, A_h
+!		real(rl), dimension(2*st%np**2,2*st%np**2)   	 		::  EqMat_p, EqMat_q
+!		real(rl), dimension(2*st%np**2)    		 			 		::  EqRhs_p, EqRhs_q, kappaVec_p, kappaVec_q
+!		real(rl), dimension(st%np,st%np)	   				 		::  Kappa_p_r,Kappa_q_r,kappa_p_c,kappa_q_c
+!		complex(cx), dimension(st%np,st%np)					 		::  Kappa_p,Kappa_q  !-- FINAL KAPPA MATRICES
+!		complex(cx),dimension(st%np,sys%nmode)  			 		::  f,h,fc,hc  		
+!		complex(cx),dimension(st%np)			   			 		::  p,q,pc,qc
+!		complex(cx),dimension(st%np)			   			 		::  der_E_pc_save,der_E_qc_save
+!		complex(cx),dimension(st%np,sys%nmode)			   	::  der_E_fc_save,der_E_hc_save
+!		integer												          		::  i,j,k,l,m,cj,ii,jj,np,info,s
+!
+!		complex(cx), dimension(st%np) 				          		::  tmpV1_p,tmpV1_q,tmpV2_p,tmpV2_q
+!		complex(cx), dimension(st%np,st%np,st%np,sys%nmode) 	::  tmpA_f1,tmpA_h1,tmpA_f2,tmpA_h2
+!		complex(cx), dimension(st%np,sys%nmode) 				   ::  tmpV1_f,tmpV1_h
+!		complex(cx), dimension(st%np,st%np,st%np,st%np)		::  D_f,D_h
+!		complex(cx), dimension(st%np,st%np,st%np)				::  E_f,E_h
+!		complex(cx), dimension(st%np,st%np)						::  K_f,K_h
+!
+!
+!		!-- A few shortcuts
+!		f=st%f;h=st%h;p=st%p;q=st%q
+!		fc=conjg(f);hc=conjg(h);pc=conjg(p);qc=conjg(q)
+!		np = st%np
+!
+!		!- set all variables to zero
+!		bigP = 0._cx;bigQ = 0._cx;bigF = 0._cx;bigH = 0._cx
+!		M_p=0._cx;M_q=0._cx;N_p=0._cx;N_q=0._cx
+!		M_pi=0._cx;M_qi=0._cx;N_pi=0._cx;N_qi=0._cx
+!		A_p=0._cx;A_q=0._cx;A_f=0._cx;A_h=0._cx
+!		eqMat_p=0._cx;eqMat_q=0._cx;eqrhs_p=0._cx;eqrhs_q=0._cx
+!		eqRhs_p = 0._cx;eqRhs_q = 0._cx
+!		v_p=0._cx;v_q=0._cx;v_f=0._cx;v_h=0._cx
+!		Kappa_p_r=0._cx;Kappa_q_r=0._cx;kappa_p_c=0._cx;kappa_q_c=0._cx
+!		kappaVec_p=0._cx; kappaVec_q=0._cx;Kappa_p=0._cx;Kappa_q=0._cx
+!		der_E_fc_save(:,:) = 0._cx
+!		der_E_hc_save(:,:) = 0._cx
+!		der_E_pc_save(:) = 0._cx
+!		der_E_qc_save(:) = 0._cx
+!		D_f = 0._cx;D_h = 0._cx
+!		E_f = 0._cx;E_h = 0._cx
+!		K_f = 0._cx;K_h = 0._cx
+!
+!		!==================================================
+!		!-- STEP 1: Computation of A_p,A_q and v_p,v_q
+!		!-- pDot(i) = sum_(j,k) [ A_p(i,j,k)*Kappa(k,j) + v_p(i) ] 
+!		!-- qDot(i) = sum_(j,k) [ A_q(i,j,k)*Kappa(k,j) + v_q(i) ] 
+!
+!		do i=1,np
+!			bigP(i) = P_j(sys,st,i)
+!			bigQ(i) = Q_j(sys,st,i)
+!			bigF(i,:) =  F_j(sys,st,i) 
+!			bigH(i,:) =  H_j(sys,st,i) 
+!		end do
+!
+!		!-- Matrix M: to be inverted
+!		M_p = st%ov_ff
+!		M_q = st%ov_hh
+!
+!		!-- perform the inversion
+!		M_pi = M_p
+!		M_qi = M_q
+!		CALL invertH(M_pi,info)
+!		CALL invertH(M_qi,info)
+!
+!		!-- Define v_p, v_q and A_p, A_q
+!		v_p = M_pi .matprod. bigP
+!		v_q = M_qi .matprod. bigQ
+!
+!		do i=1,size(A_p,1)
+!			do j=1,size(A_p,2)
+!				do k=1,size(A_p,3)
+!					A_p(i,j,k) = 0.5_rl* M_pi(i,j) * st%ov_ff(j,k) * p(k)
+!					A_q(i,j,k) = 0.5_rl* M_qi(i,j) * st%ov_hh(j,k) * q(k)
+!				end do
+!			end do
+!		end do
+!
+!
+!		!==================================================
+!		!-- STEP 2: Computation of A_f,A_h and v_f,v_h
+!		!-- fDot(i) = sum_(j,k) [ A_f(i,j,k)*Kappa(k,j) ] + v_f(i)  
+!		!-- hDot(i) = sum_(j,k) [ A_h(i,j,k)*Kappa(k,j) ] + v_h(i)  
+!
+!		do j=1,np
+!			do m=1,np
+!				N_p(j,m) = p(m)*st%ov_ff(j,m)
+!				N_q(j,m) = q(m)*st%ov_hh(j,m) 
+!			end do
+!		end do
+!
+!		!-- Calculate Nij and is inverse
+!		N_pi = N_p
+!		N_qi = N_q
+!		CALL invertGeneral(N_pi,info)
+!		CALL invertGeneral(N_qi,info)
+!
+!
+!		!-- Computation of v_f and v_h (H_i in the notes)
+!		tmpV1_f=0._cx
+!		tmpV1_h=0._cx
+!
+!		!-- First term of v_f (and v_h)
+!		tmpV1_f = bigF
+!		tmpV1_h = bigH
+!		!-- Second term of v_f
+!		do s=1,sys%nmode
+!			do j=1,np
+!				tmpV1_f(j,s) = tmpV1_f(j,s) &
+!					- sum( st%ov_ff(j,:)*v_p(:)*f(:,s) )
+!				tmpV1_h(j,s) = tmpV1_h(j,s) &
+!					- sum( st%ov_hh(j,:)*v_q(:)*h(:,s) )
+!			end do
+!			v_f(:,s) = N_pi .matprod. tmpV1_f(:,s)
+!			v_h(:,s) = N_qi .matprod. tmpV1_h(:,s)
+!		end do
+!
+!		tmpA_f1=0._cx; tmpA_h1=0._cx
+!		tmpA_f2=0._cx; tmpA_h2=0._cx
+!
+!		!-- Defining the Betref matrices, here designated by A_f and A_h
+!
+!		do s=1,sys%nmode
+!			do k=1,size(A_f,2)
+!				do j=1,size(A_f,3)
+!
+!					do i=1,size(A_f,1)
+!						tmpA_f1(i,j,k,s) = 0.5_rl* N_pi(i,j) * p(k)*f(k,s) * st%ov_ff(j,k)
+!						tmpA_h1(i,j,k,s) = 0.5_rl* N_qi(i,j) * q(k)*h(k,s) * st%ov_hh(j,k)
+!					end do
+!
+!					do l=1,np
+!						tmpA_f2(l,j,k,s) = tmpA_f2(l,j,k,s) & 
+!							- sum( A_p(:,j,k)*f(:,s)*st%ov_ff(l,:) )
+!						tmpA_h2(l,j,k,s) = tmpA_h2(l,j,k,s) &
+!							- sum( A_q(:,j,k)*h(:,s)*st%ov_hh(l,:) )
+!					end do
+!
+!				end do
+!
+!
+!				A_f(:,:,k,s) = tmpA_f1(:,:,k,s) + ( N_pi .matprod. tmpA_f2(:,:,k,s) )
+!				A_h(:,:,k,s) = tmpA_h1(:,:,k,s) + ( N_qi .matprod. tmpA_h2(:,:,k,s) )
+!
+!			end do
+!		end do
+!
+!		!==================================================
+!		!-- STEP 3: Solve the system of equations for Kappa
+!		!-- Define Q_ij, a 2*np**2 matrix: j in [1,np**2] correpsonds to Re(kappa)
+!		!--    while j in [1+np**2,2*np**2] corresponds to Im(Kappa)
+!
+!		cj = st%np**2   !-- a shortcut to get to the imagainary part of kappaVec
+!
+!		do i=1,st%np
+!			do j=1,st%np
+!				K_f(i,j) = sum( conjg(f(i,:))*v_f(i,:) + f(i,:)*conjg(v_f(i,:)) - 2._rl*conjg(f(j,:))*v_f(i,:) )
+!				K_h(i,j) = sum( conjg(h(i,:))*v_h(i,:) + h(i,:)*conjg(v_h(i,:)) - 2._rl*conjg(h(j,:))*v_h(i,:) )
+!				do k=1,st%np
+!					E_f(i,j,k) = sum( f(i,:)*conjg(A_f(i,j,k,:))  )
+!					E_h(i,j,k) = sum( h(i,:)*conjg(A_h(i,j,k,:))  )
+!					do m=1,st%np
+!						D_f(i,m,j,k) = sum( (conjg(f(i,:)) - 2._rl*conjg(f(m,:)))*A_f(i,j,k,:) )
+!						D_h(i,m,j,k) = sum( (conjg(h(i,:)) - 2._rl*conjg(h(m,:)))*A_h(i,j,k,:) )
+!					end do
+!				end do
+!			end do
+!		end do
+!
+!
+!		do i=1, np
+!			do m=1, np
+!
+!				ii = np*(i-1)+m
+!
+!				eqRhs_p(ii) 	  =  real( K_f(i,m) )
+!				eqRhs_q(ii) 	  =  real( K_h(i,m) )
+!				eqRhs_p(ii+cj)  =  aimag( K_f(i,m) )
+!				eqRhs_q(ii+cj)  =  aimag( K_h(i,m) )
+!
+!				do j=1, np
+!					do k=1, np
+!
+!						jj = np*(k-1) + j
+!
+!						eqMat_p(ii,jj) = kroneckerDelta(ii,jj) - real(  D_f(i,m,j,k) + E_f(i,j,k) )
+!						eqMat_p(ii,jj+cj) = kroneckerDelta(ii,jj+cj) + aimag(  D_f(i,m,j,k) - E_f(i,j,k) )
+!						eqMat_p(ii+cj,jj) = kroneckerDelta(ii+cj,jj) - aimag(  D_f(i,m,j,k) + E_f(i,j,k) )
+!						eqMat_p(ii+cj,jj+cj) = kroneckerDelta(ii+cj,jj+cj) - real(  D_f(i,m,j,k) - E_f(i,j,k) )
+!
+!						eqMat_q(ii,jj) = kroneckerDelta(ii,jj) - real(  D_h(i,m,j,k) + E_h(i,j,k) )
+!						eqMat_q(ii,jj+cj) = kroneckerDelta(ii,jj+cj) + aimag(  D_h(i,m,j,k) - E_h(i,j,k) )
+!						eqMat_q(ii+cj,jj) = kroneckerDelta(ii+cj,jj) - aimag(  D_h(i,m,j,k) + E_h(i,j,k) )
+!						eqMat_q(ii+cj,jj+cj) = kroneckerDelta(ii+cj,jj+cj) - real(  D_h(i,m,j,k) - E_h(i,j,k) )
+!
+!					end do
+!				end do
+!			end do
+!		end do
+!
+!
+!		!-- Apply the Lapack algorithm to solve the real system of equations
+!		!-- the solution replaces the 2nd argument
+!		kappaVec_p = eqRhs_p
+!		CALL solveEq_r(eqMat_p,kappaVec_p)
+!		kappaVec_q = eqRhs_q
+!		CALL solveEq_r(eqMat_q,kappaVec_q)
+!
+!
+!		! Convert the matrices to np*np matrix
+!		kappa_p_r = transpose(reshape(kappaVec_p(1:np**2),(/np,np/)) )
+!		kappa_p_c = transpose(reshape(kappaVec_p(1+np**2:2*np**2),(/np,np/)) )
+!		kappa_q_r = transpose(reshape(kappaVec_q(1:np**2),(/np,np/)) )
+!		kappa_q_c = transpose(reshape(kappaVec_q(1+np**2:2*np**2),(/np,np/)) )
+!
+!		kappa_p = kappa_p_r + Ic * kappa_p_c
+!		kappa_q = kappa_q_r + Ic * kappa_q_c
+!
+!		!-- Compute the pdots and qdots
+!		!-- pdot(i) = sum_j,k 0.5*M_pi(i,j)*ov(f(j),f(k))*p(k)*Kappa_p(k,j) + v_p(i)
+!
+!		tmpV1_p=0._rl;tmpV2_p=0._rl
+!		tmpV1_q=0._rl;tmpV2_q=0._rl
+!		do j=1,np
+!			tmpV1_p(j)=tmpV1_p(j) + 0.5_rl*sum( p(:)*st%ov_ff(j,:)*Kappa_p(:,j) )
+!			tmpV1_q(j)=tmpV1_q(j) + 0.5_rl*sum( q(:)*st%ov_hh(j,:)*Kappa_q(:,j) )
+!		end do
+!
+!		tmpV2_p = M_pi .matprod. tmpV1_p
+!		tmpV2_q = M_qi .matprod. tmpV1_q
+!
+!		st%pdot = tmpV2_p + v_p
+!		st%qdot = tmpV2_q + v_q
+!
+!
+!		!-- Compute the fdots and hdots
+!		!-- fdot(i) = sum_j,k [ -N_pi(i,j)*p(k)*Kappa_p(k,j)*pc(j)*f(k)*ov(f(j),f(k)) 
+!		!								+ sum_l,m [ -N_pi(i,l)*A_p(m,j,k)*Kappa_p(k,j)*pc(l)f(m)*ov(f(l),f(m)) ] ] + v_f(i)
+!		tmpV1_f=0._cx
+!		tmpV1_h=0._cx
+!
+!		do s=1, sys%nmode
+!			do i=1,np
+!				do j=1,np
+!					tmpV1_f(i,s) = tmpV1_f(i,s) + sum( A_f(i,j,:,s) * Kappa_p(:,j) )
+!					tmpV1_h(i,s) = tmpV1_h(i,s) + sum( A_h(i,j,:,s) * Kappa_q(:,j) )
+!				end do
+!			end do
+!		end do
+!
+!		st%fdot = tmpV1_f + v_f
+!		st%hdot = tmpV1_h + v_h
+!	END SUBROUTINE calcDerivatives_OLD

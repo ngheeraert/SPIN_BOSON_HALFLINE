@@ -1,4 +1,17 @@
 MODULE output
+!==============================================================================
+! MODULE OUTPUT
+!
+! High-level time evolution and diagnostics for the multipolaron simulation.
+!
+! Main responsibilities:
+!   - Time integration (RK4) of the variational equations (calls system:CalcDerivatives).
+!   - Adaptive control: monitor energy drift / error estimator and reduce timestep if needed.
+!   - Optional adaptive basis growth: add a new coherent state (polaron) when Err(t) exceeds
+!     a threshold (cf. paper's convergence discussion).
+!   - Write observables (spin components, energy, photon distributions, Wigner function).
+!==============================================================================
+
 
 	USE system
 	USE consts
@@ -7,10 +20,13 @@ MODULE output
 
 CONTAINS
 
-	!=========================================================
-	!== MAIN ROUTINE
-	!=========================================================
-
+!------------------------------------------------------------------------------
+! printTrajectory_HL
+!   Entry point for a 'half-line' waveguide simulation:
+!     - allocate the initial state & trajectory arrays,
+!     - evolve until tmax (possibly with polaron additions),
+!     - write summary observables to disk.
+!------------------------------------------------------------------------------
 	SUBROUTINE printTrajectory_HL(sys,st) 
 		type(param), intent(in out)			::  sys
 		type(state), intent(in out)			::  st
@@ -29,7 +45,11 @@ CONTAINS
 		CALL allocate_trajectory(sys,tr)
 		CALL initialise_vaccum(sys,st,0._rl)
 
-		print*,"-- state initialisation complete"
+		if (sys%verbose==1) then
+			print*,"-- state initialisation complete"
+		end if
+
+		print*, parameterchar(sys)
 
 		!========================================================
 		!-- Evolving the state until sys%tmax
@@ -76,6 +96,11 @@ CONTAINS
 		CALL print_evolution_data(sys,tr)
 	END SUBROUTINE
 
+!------------------------------------------------------------------------------
+! evolveState_HL
+!   Drive the time evolution loop up to tmax, storing observables in `tr` and calling
+!   `addpolaron` when the TDVP error estimator exceeds `sys%merr_arr` after `sys%tref_arr`.
+!------------------------------------------------------------------------------
 	SUBROUTINE evolveState_HL(sys,st,tr,tmax, add) 
 		type(param), intent(in)				::  sys
 		real(rl), intent(in)					::  tmax
@@ -110,29 +135,28 @@ CONTAINS
 
 			if ( st%t >= tini + sys%tref_arr(st%np) &
 				.and.  ( add == 1 ) &
-				.and.  ( err_ref_defined ) &
-				.and.  (err_instant -err_reference >= sys%merr_arr( st%np - sys%npini + 1 ) ) ) then 
+				.and.  (err_instant >= sys%merr_arr( st%np - sys%npini + 1 ) ) ) then 
+				!.and.  (err_instant -err_reference >= sys%merr_arr( st%np - sys%npini + 1 ) ) ) then 
 
 				exit evolution
 
 			end if
 
-			!-- ERROR REFERNCE VALUE
-			IF ( (st%t - tini > sys%tref_arr(st%np) ) .and. (.not. err_ref_defined) ) then
+			!!-- ERROR REFERNCE VALUE
+			!IF ( (st%t - tini > sys%tref_arr(st%np) ) .and. (.not. err_ref_defined) ) then
 
-				do i=1,4
-					CALL evolve_rk4( sys,st,ost,oost,1.0e4_rl )
-				end do
-				err_instant = real( error(sys,oost,ost,st) )
-				err_reference = err_instant
+			!	CALL calcderivatives( sys,st )
+			!	!CALL evolve_rk4( sys,st,ost,oost,1.0e4_rl )
+			!	err_instant = real( error(sys,ost,st) )
+			!	err_reference = err_instant
 
-				err_ref_defined = .true.
-				write( *,'(a30,f9.2)' ) "ERROR REFERENCE DEFINED AT t= ", st%t 
+			!	err_ref_defined = .true.
+			!	write( *,'(a30,f9.2)' ) "ERROR REFERENCE DEFINED AT t= ", st%t 
 
-			END IF
+			!END IF
 
 			slowfactor = 1._rl
-			dtprint = 20*sys%dt/dble(slowfactor)
+			dtprint = 4*sys%dt/dble(slowfactor)
 
 			if ((sys%npadd > 0) .and. (st%np>sys%npini)) then
 
@@ -162,10 +186,9 @@ CONTAINS
 			PRINTOUT_IF: IF ( ((st%t-tprinted) > dtprint) .or. (st%t<1e-8) ) THEN
 
 				!-- calculate 3 points with dt/10000, to obtain smooth curve for error
-				do i=1,4
-					CALL evolve_rk4( sys,st,ost,oost,1.0e4_rl )
-				end do
-				err_instant = real( error(sys,oost,ost,st) )
+				!CALL evolve_rk4( sys,st,ost,oost,1.0e4_rl )
+				CALL calcderivatives( sys,st )
+				err_instant = real( error(sys,ost,st) )
 
 				tr%time_ar(tr%i_time) = st%t
 				tr%error_ar(tr%i_time) = err_instant
@@ -195,6 +218,11 @@ CONTAINS
 		END DO EVOLUTION
 	END SUBROUTINE
 
+!------------------------------------------------------------------------------
+! print_evolution_data
+!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
+!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
+!------------------------------------------------------------------------------
 	SUBROUTINE print_evolution_data(sys,tr)
 		type(param), intent(in)  		::  sys
 		type(traj), intent(in)			::  tr
@@ -206,8 +234,6 @@ CONTAINS
 		name_np=trim(adjustl(sys%file_path))//"/np_"//trim(adjustl(parameterchar(sys)))//".d"
 		name_ErEN=trim(adjustl(sys%file_path))//"/ErEN_"//trim(adjustl(parameterchar(sys)))//".d"
 		name_ps=trim(adjustl(sys%file_path))//"/ps_"//trim(adjustl(parameterchar(sys)))//".d"
-		!name_info=trim(adjustl(sys%file_path))//"/info_"//trim(adjustl(parameterchar(sys)))//".d"
-		!name_deltaR=trim(adjustl(sys%file_path))//"/deltaR_"//trim(adjustl(parameterchar(sys)))//".d"
 
 		open (unit=10,file=name_ErEN,action="write",status="replace")
 		open (unit=11,file= name_spinXYZ,action="write",status="replace")
@@ -217,7 +243,7 @@ CONTAINS
 		do i=1, tr%i_time	-1
 
 			t = tr%time_ar(i)
-			write(10,*) t, tr%error_ar(i), tr%energy_ar(i), tr%norm_ar(i)
+			write(10,'(4f25.10)') t, tr%error_ar(i), tr%energy_ar(i), tr%norm_ar(i)
 			write(11,'(f25.15,3f25.10)') t, tr%spinXYZ_ar(i,1), tr%spinXYZ_ar(i,2), tr%spinXYZ_ar(i,3)
 			write(12,*) t, tr%np_ar(i)
 
@@ -233,28 +259,14 @@ CONTAINS
 		close(12)
 		close(13)
 
-		!if ( sys%prep < 100 ) then
-		!else if ( sys%prep == 100 ) then
-
-		!if (sys%prep==2) then
-		!  open (unit=19,file= name_deltaR,action="write",status="replace")
-		!end if
-
-		! name_E=trim(adjustl(sys%file_path))//"/Echi_"//trim(adjustl(parameterchar(sys)))//".d"
-		! name_err=trim(adjustl(sys%file_path))//"/errchi_"//trim(adjustl(parameterchar(sys)))//".d"
-		! open (unit=10,file=name_E,action="write",status="replace")
-		! open (unit=20,file=name_err,action="write",status="replace")
-
-		! name_chi_w=trim(adjustl(sys%file_path))//"/chi_w_"//trim(adjustl(parameterchar(sys)))//".d"
-		! name_chi_t=trim(adjustl(sys%file_path))//"/chi_t_"//trim(adjustl(parameterchar(sys)))//".d"
-		! open (unit=16,file=name_chi_w,action="write",status="replace")
-		! open (unit=161,file=name_chi_t,action="write",status="replace")
-
-		!end if
 	END SUBROUTINE
 
-	!-- Evolution routine --  NOTE: to minimize the number of calculations certain sums are stored in state,
-	!		 therefore after every timestep, these variables are updated with	update_sums.
+!------------------------------------------------------------------------------
+! evolve_RK4
+!   One integration step using classic 4th-order Runge-Kutta on the variational ODEs.
+!   The parameter `slowfactor` can be used to effectively reduce dt (dt/slowfactor) when
+!   the adaptive timestep control detects too large an energy drift.
+!------------------------------------------------------------------------------
 	SUBROUTINE Evolve_RK4(sys,st,ost,oost,slowfactor)
 		type(state),intent(in out)   ::  st, ost, oost
 		type(param),intent(in)   		::  sys
@@ -332,15 +344,21 @@ CONTAINS
 	END SUBROUTINE evolve_RK4
 
 	!-- routine to add polarons
+!------------------------------------------------------------------------------
+! addpolaron
+!   Increase Ncs by 1 by reallocating the state and appending an extra coherent state
+!   initialized near vacuum (small amplitude `sys%p0`). This is the adaptive basis growth
+!   mechanism used to keep the TDVP error small while maintaining Ncs << Nmodes.
+!------------------------------------------------------------------------------
 	SUBROUTINE addpolaron(sys,st)
-		type(param), intent(in)			:: sys
-		type(state), intent(in out)   :: st
-		type(state)						   :: st_add
-		type(state)						   :: wp_st_0_at_t,cl_st_0,st_0
-		type(state)					 		:: ba_st,ba_st_aa
-		real(rl)								:: a,b
-		integer								:: n,k
-		real(rl)								::	E1,E2,SZ1,SZ2,SX1,SX2
+		type(param), intent(in)			::   sys
+		type(state), intent(in out)     ::   st
+		type(state)					 	::   ba_st
+		real(rl)						::   a,b
+		integer							::   n,k
+		real(rl)						::   E1,E2,SZ1,SZ2,SX1,SX2
+
+		CALL update_sums(sys,st)
 
 		E1 = energy(sys,st)
 		SZ1 = sigmaZ(st)
@@ -349,12 +367,8 @@ CONTAINS
 
 		!-- Re-allocate st with more polarons
 		CALL allocate_state(sys,st,ba_st%np+1)
-		CALL allocate_state(sys,st_add,1)
-		CALL allocate_state(sys,cl_st_0,1)
 
 		st%t = ba_st%t
-		st_add%f(:,:) = 0._cx
-		st_add%h(:,:) = 0._cx
 
 		do n=1, ba_st%np
 			st%f(n,:) = ba_st%f(n,:)
@@ -362,28 +376,35 @@ CONTAINS
 			st%p(n) = ba_st%p(n)
 			st%q(n) = ba_st%q(n)
 		end do
-		do n= 1, 1
-			st%f(ba_st%np+n,:) = st_add%f(n,:)
-			st%h(ba_st%np+n,:) = st_add%h(n,:)
-			st%p(ba_st%np+n) = IP_p
-			st%q(ba_st%np+n) = (-1)**(st%np) * IP_p
-		end do
+		st%f(ba_st%np+1,:) = 0._cx
+		st%h(ba_st%np+1,:) = 0._cx
+		st%p(ba_st%np+1) = sys%p0
+		st%q(ba_st%np+1) = sys%p0
 
 		CALL update_sums(sys,st)
-		CALL normalise(st)
+		!CALL normalise(st)
 
-		print*,"================================="
-		write(*,'(a21,I5,a4,I3,a6,f9.2)') "POLARON ADDED: from ",st%np-st_add%np," to ",st%np, "at t=", st%t 
-		E2 = energy(sys,st)
-		SZ2 = sigmaZ(st)
-		SX2 = sigmaX(st)
-		print*, "delta( Sz ) = ",SZ2-SZ1
-		print*, "delta( Sx ) = ",SX2-SX1
-		print*, "delta( E ) = ",E2-E1
-		print*,"================================="
-		print*, " "
+		if (sys%verbose==1) then
+			print*,"================================="
+			write(*,'(a21,I5,a4,I3,a6,f9.2)') "POLARON ADDED: from ",ba_st%np," to ",st%np, "at t=", st%t 
+			E2 = energy(sys,st)
+			SZ2 = sigmaZ(st)
+			SX2 = sigmaX(st)
+			print*, "delta( Sz ) = ",SZ2-SZ1
+			print*, "delta( Sx ) = ",SX2-SX1
+			print*, "delta( E ) = ",E2-E1
+			print*,"================================="
+			print*, " "
+		end if
+
 	END SUBROUTINE
 
+!------------------------------------------------------------------------------
+! checkTimestep
+!   Practical stabilizer: if the variational integration produces an energy drift larger
+!   than `errorlimit`, the routine rewinds two steps and re-evolves with a reduced dt
+!   (increasing `slowfactor`) until the drift is acceptable or a max number of retries is hit.
+!------------------------------------------------------------------------------
 	SUBROUTINE checkTimestep(sys,st,ost,oost,slowfactor,errorlimit)
 		type(param), intent(in)			:: sys
 		type(state), intent(in out)   :: st, ost, oost
@@ -411,7 +432,10 @@ CONTAINS
 		FIXING: do
 
 			if ( (abs(deltaE) < errorlimit) .or. (fixtry > 20) ) exit fixing
-			print*, "FIXING: t,deltaE=",st%t,deltaE
+
+			if (sys%verbose==1) then
+				print*, "FIXING: t,deltaE=",st%t,deltaE
+			end if
 
 			fixtry = fixtry + 1 	!-- keep track of the number of tries
 			st = oost_tofix				 	!-- rewind evolution by 2 steps
@@ -425,7 +449,9 @@ CONTAINS
 			RE_EVOLVE: do
 
 				if ( st_tofix%t+2*sys%dt  < st%t ) exit RE_EVOLVE
-				write(*,'(I10)',advance='no') int( slowfactorFix )
+				if (sys%verbose==1) then
+					write(*,'(I10)',advance='no') int( slowfactorFix )
+				end if
 				CALL evolve_RK4(sys,st,ost,oost,slowfactorFix)
 
 			end do RE_EVOLVE
@@ -439,7 +465,9 @@ CONTAINS
 				best_ost = ost
 			end if
 
-			print*, "END FIXING"
+			if (sys%verbose==1) then
+				print*, "END FIXING"
+			end if
 		end do FIXING
 
 		if ( (fixtry .ne. 0) .and. (abs(deltaE) < errorlimit) ) then
@@ -454,7 +482,9 @@ CONTAINS
 
 			if (abs(deltaE) > 1.0e-5_rl) then
 
-				print*,"ABORT -- error in the energy is too high"
+				if (sys%verbose==1) then
+					print*,"ABORT -- error in the energy is too high"
+				end if
 
 				!print*,"DELETING ALL evolution files: ",trim(adjustl(parameterchar(sys)))
 				!CALL system('rm data/*'//trim(adjustl(parameterchar(sys)))//'*')
@@ -486,11 +516,12 @@ CONTAINS
 		end if
 	END SUBROUTINE
 
-	!=========================================================
-	!== Printing routines
-	!=========================================================
-
 	!== printing the state vector
+!------------------------------------------------------------------------------
+! print_fks
+!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
+!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
+!------------------------------------------------------------------------------
 	SUBROUTINE print_fks(sys,st,label, makefilename)
 		type(param), intent(in)			::  sys
 		type(state), intent(in)			::  st
@@ -532,6 +563,11 @@ CONTAINS
 		close(100)
 	END SUBROUTINE
 
+!------------------------------------------------------------------------------
+! print_ps
+!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
+!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
+!------------------------------------------------------------------------------
 	SUBROUTINE print_ps(sys, st, label, makefilename)
 		type(param), intent(in)			::  sys
 		type(state), intent(in)			::  st
@@ -559,6 +595,11 @@ CONTAINS
 		close(100)
 	END SUBROUTINE
 
+!------------------------------------------------------------------------------
+! print_fxs
+!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
+!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
+!------------------------------------------------------------------------------
 	SUBROUTINE print_fxs(sys,st,label,makefilename)
 		type(param), intent(in)		 ::  sys
 		type(state), intent(in)		 ::  st
@@ -596,6 +637,11 @@ CONTAINS
 	END SUBROUTINE
 
 	!== printing MEAN PHOTON NUMBERS
+!------------------------------------------------------------------------------
+! print_nk
+!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
+!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
+!------------------------------------------------------------------------------
 	SUBROUTINE print_nk(sys,st_in) 
 		type(param), intent(in)			  	::  sys
 		type(state), intent(in), optional	::  st_in
@@ -629,6 +675,11 @@ CONTAINS
 		close(105)
 	END SUBROUTINE
 
+!------------------------------------------------------------------------------
+! print_nx
+!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
+!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
+!------------------------------------------------------------------------------
 	SUBROUTINE print_nx(sys,st,label) 
 		type(param), intent(in)		 ::  sys
 		type(state), intent(in)		 ::  st
@@ -665,6 +716,11 @@ CONTAINS
 	END SUBROUTINE
 
 	!-- wigner function
+!------------------------------------------------------------------------------
+! wignerise / printwigner
+!   Compute and export a phase-space Wigner function for the emitted wavepacket.
+!   This is used to visualize Schrodinger cat structure (interference fringes).
+!------------------------------------------------------------------------------
 	SUBROUTINE wignerise(sys,st) 
 		type(param), intent(in)			  	::  sys
 		type(state), intent(in)		  		::  st
