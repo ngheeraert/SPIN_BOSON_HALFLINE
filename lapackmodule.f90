@@ -1,22 +1,38 @@
-MODULE lapackmodule
-!==============================================================================
-! MODULE lapackmodule
+! ==============================================================================
+!  MODULE: lapackmodule.f90
 !
-! Thin wrappers around a few LAPACK routines used in this project.
-! Provides matrix inversion and linear system solving for real/complex matrices,
-! and defines custom operators for matrix addition/product for readability.
-!==============================================================================
-
+!  PURPOSE & CONTEXT
+!    High-performance linear algebra interface for the waveguide QED simulation.
+!    Provides Fortran wrappers around standard BLAS and LAPACK routines to handle 
+!    the dense, complex tensor operations required by the TDVP equations of motion.
+!    Associated paper: N. Gheeraert et al., New J. Phys. 19 (2017) 023036.
+!
+!  PHYSICS & NUMERICS CONTEXT
+!    The multi-polaron ansatz yields a non-orthogonal basis. The resulting metric 
+!    tensors (overlap matrices) and explicit derivative matrices must be inverted s
+!    or solved continuously during the RK4 time integration. Because these matrices 
+!    can become ill-conditioned as the basis grows, robust LAPACK solvers with 
+!    pivoting (LU, Bunch-Kaufman) are essential to maintain numerical stability.
+!
+!  CORE RESPONSIBILITIES
+!    1. Inversions      : Cholesky (`ZPOTRF`), LU (`ZGETRF`), and Bunch-Kaufman (`ZHETRF`).
+!    2. Linear Solvers  : Direct linear system solvers (`DGESV`, `ZGESV`).
+!    3. Operator Overloads: Maps custom operators (`.matadd.`, `.matprod.`) to 
+!                           highly optimized Level-3 BLAS (`ZGEMM`, `DGEMM`).
+! ==============================================================================
+MODULE lapackmodule
 
 USE typedefs, only : cx => c_type, rl=> r_type
 USE consts
 
 implicit none
 
-  INTERFACE OPERATOR (.matadd.)
-    module procedure matadd_r, matadd_c
-  END INTERFACE OPERATOR (.matadd.)
-
+  ! ----------------------------------------------------------------------------
+  ! OPERATOR INTERFACE
+  !   These overloads allow the physics code in `system.f90` to remain readable 
+  !   (e.g., `A .matprod. B`) while guaranteeing the underlying execution utilizes 
+  !   cache-optimized BLAS routines rather than unoptimized intrinsic operations.
+  ! ----------------------------------------------------------------------------
   INTERFACE OPERATOR(.matprod.)
     module procedure matmultiply_c_rank12, matmultiply_c_rank21, matmultiply_c_rank22,&
            matmultiply_r_rank12, matmultiply_r_rank21, matmultiply_r_rank22
@@ -25,12 +41,17 @@ implicit none
   
 CONTAINS
 
-  ! --> Inverse of a Hermitian Positive Definite matrix
-!------------------------------------------------------------------------------
-! InvertHPD
-!   Invert a Hermitian positive definite matrix using Cholesky (ZPOTRF/ZPOTRI).
-!   Used when the variational metric is guaranteed HPD.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: InvertHPD
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Inverts a Hermitian Positive Definite (HPD) matrix using Cholesky 
+  !>   factorization (`ZPOTRF` / `ZPOTRI`). Highly efficient, but requires 
+  !>   strict positive-definiteness. Often used for perfectly conditioned 
+  !>   overlap metrics. Explicitly reconstructs the lower triangular half.
+  !> Arguments:
+  !>   - A : The HPD matrix to be inverted (modified in-place).
+  !>
   SUBROUTINE InvertHPD(A)
 
     COMPLEX(8), intent(in out)                      ::  A(:,:)
@@ -62,10 +83,17 @@ CONTAINS
 
   END SUBROUTINE InvertHPD
 
-!------------------------------------------------------------------------------
-! InvertGeneral
-!   Invert a general complex matrix (ZGETRF/ZGETRI). Use with care (numerical stability).
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: InvertGeneral
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Inverts a general dense complex matrix via LU factorization with partial 
+  !>   pivoting (`ZGETRF` / `ZGETRI`). Used as a robust fallback when matrices 
+  !>   lose symmetry or positive-definiteness during highly non-linear dynamics.
+  !> Arguments:
+  !>   - A    : The general complex matrix to be inverted (modified in-place).
+  !>   - info : Output error flag (0 = success).
+  !>
   SUBROUTINE InvertGeneral(A,info)
     COMPLEX(cx), intent(in out)                  ::  A(:,:)
     integer, intent(out)								 ::  info
@@ -97,11 +125,17 @@ CONTAINS
 
   END SUBROUTINE InvertGeneral
 
-  ! --> Inverse of a Hermitian Indefinite matrix
-!------------------------------------------------------------------------------
-! InvertH
-!   Invert a Hermitian (not necessarily positive) matrix via Bunch-Kaufman (ZHETRF/ZHETRI).
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: InvertH
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Inverts a Hermitian Indefinite matrix using Bunch-Kaufman diagonal 
+  !>   pivoting (`ZHETRF` / `ZHETRI`). Safe for Hermitian overlap matrices 
+  !>   that may have developed near-zero eigenvalues due to basis over-completeness.
+  !> Arguments:
+  !>   - A    : The complex Hermitian matrix (modified in-place).
+  !>   - info : Output error flag (0 = success).
+  !>
   SUBROUTINE InvertH(A,info)
     COMPLEX(cx), intent(in out)                  ::  A(:,:)
     integer, intent(out)								 ::  info
@@ -140,11 +174,13 @@ CONTAINS
 
   END SUBROUTINE InvertH
 
-  ! --> Solve General Complex Equations
-!------------------------------------------------------------------------------
-! SolveEq_r
-!   Solve A x = b for real matrices using DGESV (LU + pivoting).
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: SolveEq_r
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Solves the real linear system $A \cdot x = B$ using standard LU 
+  !>   decomposition (`DGESV`). Overwrites $B$ with the solution vector.
+  !>
   SUBROUTINE SolveEq_r(A,B)
     REAL(rl), intent(in out)               ::  A(:,:)
 	 REAL(rl), intent(in out)					 ::  B(:)
@@ -165,10 +201,15 @@ CONTAINS
 	 end if
 
   END SUBROUTINE SolveEq_r
-!------------------------------------------------------------------------------
-! SolveEq_c
-!   Solve A x = b for complex matrices using ZGESV (LU + pivoting).
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: SolveEq_c
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Solves the complex linear system $A \cdot x = B$ using LU decomposition 
+  !>   (`ZGESV`). Used predominantly by `inverse.f90` to resolve the flattened 
+  !>   variational $\kappa$ tensor system.
+  !>
     SUBROUTINE SolveEq_c(A,B)
 
     COMPLEX(cx), intent(in out)               ::  A(:,:)
@@ -191,24 +232,17 @@ CONTAINS
 
  END SUBROUTINE
 
-
-  ! --> Matrix muliplication
-  !FUNCTION matmultiply_c(amat,bmat) RESULT(outmat)
-
-  !  complex(cx), dimension(:,:), intent(in)            :: amat
-  !  complex(cx), dimension(:,:), intent(in)            :: bmat
-  !  complex(cx), dimension(:,:)  :: outmat
-
-  !  call zgemm ('N','N',size(amat,1),size(bmat,2),size(amat,2),one_r,amat,&
-  !       size(amat,1),bmat,size(bmat,1), zero_r,outmat,size(outmat,1))
-
-  !END FUNCTION matmultiply_c
-
-  !-- Complex Matrix Multiplication
-!------------------------------------------------------------------------------
-! matmultiply_*
-!   Thin zgemm/dgemm wrappers to express BLAS matrix products with Fortran arrays.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> FUNCTIONS: matmultiply_c_rank** / matmultiply_r_rank**
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   A suite of operator overloads mapping `.matprod.` to Level-3 BLAS (`ZGEMM` 
+  !>   and `DGEMM`). 
+  !>   - rank22: Matrix * Matrix.
+  !>   - rank21: Matrix * Column Vector.
+  !>   - rank12: Row Vector * Matrix (transposes the 1D input array automatically).
+  !>
+  ! -- Complex Matrix Multiplication --
   FUNCTION matmultiply_c_rank22(A,B) RESULT(C)
 
     complex(cx), dimension(:,:), intent(in)            ::  A
@@ -319,33 +353,5 @@ CONTAINS
 
   END FUNCTION matmultiply_r_rank12
 
-  ! --> Matrix addition (not lapack)
-  FUNCTION matadd_c(amat,bmat) RESULT(out_mat)
-    integer :: i,j
-    complex(cx), dimension(:,:), intent(in)        :: amat
-    complex(cx), dimension(:,:), intent(in)        :: bmat
-    complex(cx), dimension(size(amat,1),size(amat,2))  :: out_mat
-
-    do i=1,size(amat,1)
-       do j=1,size(amat,2)
-          out_mat(i,j) = amat(i,j) + bmat(i,j)
-       end do
-    end do
-    return
-  END FUNCTION matadd_c
-
-  FUNCTION matadd_r(amat,bmat) RESULT(out_mat)
-    integer :: i,j
-    real(rl), dimension(:,:), intent(in)        :: amat
-    real(rl), dimension(:,:), intent(in)        :: bmat
-    real(rl), dimension(size(amat,1),size(amat,2))  :: out_mat
-
-    do j=1,size(amat,2)
-		do i=1,size(amat,1)
-		  out_mat(i,j) = amat(i,j) + bmat(i,j)
-       end do
-    end do
-    return
-  END FUNCTION matadd_r
 
 END MODULE lapackmodule

@@ -1,17 +1,35 @@
+! ==============================================================================
+!  MODULE: output.f90 (output)
+!
+!  PURPOSE & CONTEXT
+!    High-level execution driver and data I/O module for the simulation of 
+!    spontaneous emission in the ultrastrong-coupling (USC) spin-boson model.
+!    Generates the data underlying the time-domain results and Schrödinger cat 
+!    analyses in:
+!      N. Gheeraert et al., "Spontaneous emission of Schrödinger cats in a 
+!      waveguide at ultrastrong coupling", New J. Phys. 19 (2017) 023036.
+!
+!  CORE RESPONSIBILITIES
+!    1. Orchestration  : Drives the primary simulation trajectory (`printTrajectory_HL`).
+!    2. Time Evolution : Integrates the TDVP Euler-Lagrange equations via a 
+!                        custom 4th-order Runge-Kutta (RK4) solver.
+!    3. Adaptive Basis : Implements dynamic basis expansion (`addpolaron`), 
+!                        injecting new coherent states when the McLachlan error 
+!                        exceeds defined thresholds to capture complex entanglement.
+!    4. I/O & Metrics  : Exports time-series diagnostics (energy, error, spin) 
+!                        and evaluates phase-space observables (Wigner functions, 
+!                        photon densities) separating the bound dressing cloud 
+!                        from the propagating wavepacket.
+!
+!  EXECUTION HIERARCHY
+!      main.f90 
+!       └── output:printTrajectory_HL 
+!            ├── output:evolveState_HL 
+!            │    └── output:Evolve_RK4 (integrator)
+!            │         └── system:CalcDerivatives (computes variational EOMs)
+!            └── output:addpolaron (dynamically expands basis if error is high)
+! ==============================================================================
 MODULE output
-!==============================================================================
-! MODULE OUTPUT
-!
-! High-level time evolution and diagnostics for the multipolaron simulation.
-!
-! Main responsibilities:
-!   - Time integration (RK4) of the variational equations (calls system:CalcDerivatives).
-!   - Adaptive control: monitor energy drift / error estimator and reduce timestep if needed.
-!   - Optional adaptive basis growth: add a new coherent state (polaron) when Err(t) exceeds
-!     a threshold (cf. paper's convergence discussion).
-!   - Write observables (spin components, energy, photon distributions, Wigner function).
-!==============================================================================
-
 
 	USE system
 	USE consts
@@ -20,13 +38,21 @@ MODULE output
 
 CONTAINS
 
-!------------------------------------------------------------------------------
-! printTrajectory_HL
-!   Entry point for a 'half-line' waveguide simulation:
-!     - allocate the initial state & trajectory arrays,
-!     - evolve until tmax (possibly with polaron additions),
-!     - write summary observables to disk.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: printTrajectory_HL
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Primary orchestrator for the 'half-line' waveguide simulation. It manages 
+  !>   the full lifecycle of a trajectory: allocating the initial variational state 
+  !>   and time-series arrays, preparing the initial condition (e.g., atomic excitation), 
+  !>   and triggering the main evolution loops. It handles the distinct phases of 
+  !>   adaptive basis growth (where polarons are dynamically added) and fixed-basis 
+  !>   evolution, culminating in the export of final macroscopic observables like 
+  !>   momentum and real-space photon densities.
+  !> Arguments:
+  !>   - sys : Parameter structure (grid sizes, couplings, run controls).
+  !>   - st  : Target state to be initialized and evolved.
+  !>
 	SUBROUTINE printTrajectory_HL(sys,st) 
 		type(param), intent(in out)			::  sys
 		type(state), intent(in out)			::  st
@@ -96,11 +122,25 @@ CONTAINS
 		CALL print_evolution_data(sys,tr)
 	END SUBROUTINE
 
-!------------------------------------------------------------------------------
-! evolveState_HL
-!   Drive the time evolution loop up to tmax, storing observables in `tr` and calling
-!   `addpolaron` when the TDVP error estimator exceeds `sys%merr_arr` after `sys%tref_arr`.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: evolveState_HL
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   The core integration loop. Advances the variational state through time using 
+  !>   the `evolve_RK4` routine while continuously logging time-series observables. 
+  !>   It actively monitors the Dirac-Frenkel error metric against the 
+  !>   exact Schrödinger dynamics. If this error exceeds the defined threshold 
+  !>   (`merr_arr`) after a minimum cooldown interval (`tref_arr`), the routine 
+  !>   cleanly halts the loop to signal the orchestrator to inject a new coherent 
+  !>   state (polaron), dynamically adapting the basis to capture growing multi-photon 
+  !>   complexity.
+  !> Arguments:
+  !>   - sys  : Parameter structure.
+  !>   - st   : State to be evolved in-place.
+  !>   - tr   : Trajectory object for storing time-series metrics.
+  !>   - tmax : Target time for this specific evolution block.
+  !>   - add  : Integer flag toggling the adaptive error-checking interruptions.
+  !>
 	SUBROUTINE evolveState_HL(sys,st,tr,tmax, add) 
 		type(param), intent(in)				::  sys
 		real(rl), intent(in)					::  tmax
@@ -218,11 +258,19 @@ CONTAINS
 		END DO EVOLUTION
 	END SUBROUTINE
 
-!------------------------------------------------------------------------------
-! print_evolution_data
-!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
-!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: print_evolution_data
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Handles the disk I/O for time-series diagnostics. Exports crucial stability 
+  !>   and physical metrics including the energetic invariance, state normalization, 
+  !>   variational error, atomic spin dynamics (Pauli X, Y, Z expectation values), 
+  !>   the active basis dimension ($N_{cs}$), and the temporal evolution of the 
+  !>   constituent probability amplitudes.
+  !> Arguments:
+  !>   - sys : Parameter structure defining output paths.
+  !>   - tr  : Populated trajectory object containing the logged data.
+  !>
 	SUBROUTINE print_evolution_data(sys,tr)
 		type(param), intent(in)  		::  sys
 		type(traj), intent(in)			::  tr
@@ -261,12 +309,23 @@ CONTAINS
 
 	END SUBROUTINE
 
-!------------------------------------------------------------------------------
-! evolve_RK4
-!   One integration step using classic 4th-order Runge-Kutta on the variational ODEs.
-!   The parameter `slowfactor` can be used to effectively reduce dt (dt/slowfactor) when
-!   the adaptive timestep control detects too large an energy drift.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: Evolve_RK4
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   The numerical integrator. Performs a standard 4th-order Runge-Kutta (RK4) 
+  !>   step to propagate the complex variational parameters (f, h, p, q). Evaluates 
+  !>   the computationally heavy dense linear equations of motion via `CalcDerivatives` 
+  !>   four times per step. Integrates an optional `slowfactor` to dynamically 
+  !>   compress the integration timestep during periods of stiff transient dynamics, 
+  !>   such as the immediate onset of ultra-fast spontaneous energy relaxation.
+  !> Arguments:
+  !>   - sys        : Parameter structure.
+  !>   - st         : Current state (updated in-place to t + dt).
+  !>   - ost        : Old state tracking (t - dt).
+  !>   - oost       : Old-old state tracking (t - 2dt).
+  !>   - slowfactor : Optional divisor to temporarily reduce the integration timestep.
+  !>
 	SUBROUTINE Evolve_RK4(sys,st,ost,oost,slowfactor)
 		type(state),intent(in out)   ::  st, ost, oost
 		type(param),intent(in)   		::  sys
@@ -343,13 +402,20 @@ CONTAINS
 		st%t = st%t + dt
 	END SUBROUTINE evolve_RK4
 
-	!-- routine to add polarons
-!------------------------------------------------------------------------------
-! addpolaron
-!   Increase Ncs by 1 by reallocating the state and appending an extra coherent state
-!   initialized near vacuum (small amplitude `sys%p0`). This is the adaptive basis growth
-!   mechanism used to keep the TDVP error small while maintaining Ncs << Nmodes.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: addpolaron
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   The mechanism for adaptive basis expansion. Triggered when the variational 
+  !>   error crosses the stability threshold. Reallocates the memory for the system 
+  !>   state vectors to accommodate $N_{cs} + 1$ dimensions. It seamlessly copies 
+  !>   the current active state into the expanded arrays and initializes the appended 
+  !>   "polaron" as a near-vacuum coherent state with a minimal amplitude. Logs the 
+  !>   energy and spin to verify that the basis shift preserves physical continuity.
+  !> Arguments:
+  !>   - sys : Parameter structure.
+  !>   - st  : Target state to be expanded and reallocated in-place.
+  !>
 	SUBROUTINE addpolaron(sys,st)
 		type(param), intent(in)			::   sys
 		type(state), intent(in out)     ::   st
@@ -399,12 +465,25 @@ CONTAINS
 
 	END SUBROUTINE
 
-!------------------------------------------------------------------------------
-! checkTimestep
-!   Practical stabilizer: if the variational integration produces an energy drift larger
-!   than `errorlimit`, the routine rewinds two steps and re-evolves with a reduced dt
-!   (increasing `slowfactor`) until the drift is acceptable or a max number of retries is hit.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: checkTimestep
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   A robust numerical failsafe and adaptive time-stepping controller. Continuously 
+  !>   monitors the total system energy—a strict invariant under exact unitary 
+  !>   Schrödinger dynamics. If the instantaneous energy drift between integration 
+  !>   steps exceeds `errorlimit`, it rewinds the RK4 solver by two historical steps 
+  !>   and re-evolves the state utilizing a dynamically compressed timestep 
+  !>   (`slowfactorFix`). This prevents catastrophic numerical blowups when navigating 
+  !>   steep energetic gradients.
+  !> Arguments:
+  !>   - sys        : Parameter structure.
+  !>   - st         : Current state (potentially rewound and fixed).
+  !>   - ost        : Previous state buffer.
+  !>   - oost       : Oldest state buffer.
+  !>   - slowfactor : Base timestep divisor.
+  !>   - errorlimit : Maximum tolerable energy fluctuation threshold.
+  !>
 	SUBROUTINE checkTimestep(sys,st,ost,oost,slowfactor,errorlimit)
 		type(param), intent(in)			:: sys
 		type(state), intent(in out)   :: st, ost, oost
@@ -516,12 +595,20 @@ CONTAINS
 		end if
 	END SUBROUTINE
 
-	!== printing the state vector
-!------------------------------------------------------------------------------
-! print_fks
-!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
-!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: print_fks
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Exports the complex multi-mode momentum-space displacement arrays ($f_k, h_k$) 
+  !>   for all active polarons within the current basis. This raw phase-space data 
+  !>   is essential for reconstructing the continuous frequency spectrum and evaluating 
+  !>   the underlying multi-photon structure of the generated Schrödinger cats.
+  !> Arguments:
+  !>   - sys          : Parameter structure.
+  !>   - st           : State containing the displacements.
+  !>   - label        : String tag for identifying the output step/condition.
+  !>   - makefilename : Optional override for standard file naming conventions.
+  !>
 	SUBROUTINE print_fks(sys,st,label, makefilename)
 		type(param), intent(in)			::  sys
 		type(state), intent(in)			::  st
@@ -563,11 +650,20 @@ CONTAINS
 		close(100)
 	END SUBROUTINE
 
-!------------------------------------------------------------------------------
-! print_ps
-!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
-!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: print_ps
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Exports the complex probability amplitudes ($p_n, q_n$) associated with the 
+  !>   atomic 'up' and 'down' manifolds for each constituent polaron. Tracks the 
+  !>   statistical weight and relative phase of each coherent state component in 
+  !>   the global quantum superposition.
+  !> Arguments:
+  !>   - sys          : Parameter structure.
+  !>   - st           : Target state.
+  !>   - label        : String tag for the output file.
+  !>   - makefilename : Optional naming override.
+  !>
 	SUBROUTINE print_ps(sys, st, label, makefilename)
 		type(param), intent(in)			::  sys
 		type(state), intent(in)			::  st
@@ -595,11 +691,21 @@ CONTAINS
 		close(100)
 	END SUBROUTINE
 
-!------------------------------------------------------------------------------
-! print_fxs
-!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
-!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: print_fxs
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Exports the real-space displacement profiles ($f(x), h(x)$) of the constituent 
+  !>   polarons. Converts the momentum arrays into spatial coordinates via a discrete 
+  !>   Fourier transform to visualize the physical separation of the ballistically 
+  !>   propagating wavepacket from the static, highly localized entanglement cloud 
+  !>   dressing the artificial atom.
+  !> Arguments:
+  !>   - sys          : Parameter structure defining spatial bounds and `dx`.
+  !>   - st           : Target state.
+  !>   - label        : String tag for the output file.
+  !>   - makefilename : Optional naming override.
+  !>
 	SUBROUTINE print_fxs(sys,st,label,makefilename)
 		type(param), intent(in)		 ::  sys
 		type(state), intent(in)		 ::  st
@@ -636,12 +742,19 @@ CONTAINS
 		close(100)
 	END SUBROUTINE
 
-	!== printing MEAN PHOTON NUMBERS
-!------------------------------------------------------------------------------
-! print_nk
-!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
-!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: print_nk
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Computes and exports the macroscopic momentum-space photon number density 
+  !>   $n(k) = \langle a^\dagger_k a_k \rangle / dk$. Crucially, it isolates the 
+  !>   dynamics of spontaneous emission by applying a spatial windowing filter 
+  !>   (`wigxmin`, `wigxmax`) that computationally extracts the freely propagating 
+  !>   Schrödinger cat wavepacket while omitting the bound dressing cloud.
+  !> Arguments:
+  !>   - sys   : Parameter structure.
+  !>   - st_in : Optional incoming state override (reads from disk if omitted).
+  !>
 	SUBROUTINE print_nk(sys,st_in) 
 		type(param), intent(in)			  	::  sys
 		type(state), intent(in), optional	::  st_in
@@ -675,11 +788,21 @@ CONTAINS
 		close(105)
 	END SUBROUTINE
 
-!------------------------------------------------------------------------------
-! print_nx
-!   Write diagnostic data to file for later plotting (field displacements, spin amplitudes,
-!   photon-number distributions, etc.). Filenames are constructed from the parameter set.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: print_nx
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Computes and exports the spatially resolved, macroscopic photon density 
+  !>   profile $n(x)$. By projecting the momentum arrays into real space, this 
+  !>   routine allows visualization of the ballistic propagation of the emitted 
+  !>   wavepacket moving at the speed of light ($x \approx t$), clearly separating 
+  !>   it from the static, exponentially localized virtual photon cloud dressing 
+  !>   the atom at $x = 0$.
+  !> Arguments:
+  !>   - sys   : Parameter structure defining the spatial grid `dx`.
+  !>   - st    : Target state to evaluate.
+  !>   - label : String tag for the output file.
+  !>
 	SUBROUTINE print_nx(sys,st,label) 
 		type(param), intent(in)		 ::  sys
 		type(state), intent(in)		 ::  st
@@ -715,12 +838,18 @@ CONTAINS
 		close(105)
 	END SUBROUTINE
 
-	!-- wigner function
-!------------------------------------------------------------------------------
-! wignerise / printwigner
-!   Compute and export a phase-space Wigner function for the emitted wavepacket.
-!   This is used to visualize Schrodinger cat structure (interference fringes).
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: wignerise
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   High-level wrapper for phase-space tomography. Constructs the dynamically 
+  !>   named output file based on the spatial filtering window (`wigxmin`, 
+  !>   `wigxmax`) and triggers the computationally heavy evaluation of the 
+  !>   Wigner quasi-probability distribution via `printwigner`.
+  !> Arguments:
+  !>   - sys : Parameter structure defining the spatial filtering boundaries.
+  !>   - st  : Current multi-polaron state.
+  !>
 	SUBROUTINE wignerise(sys,st) 
 		type(param), intent(in)			  	::  sys
 		type(state), intent(in)		  		::  st
@@ -736,7 +865,29 @@ CONTAINS
 		CALL printwigner(100,sys,st,50)
 		close(100)
 	END SUBROUTINE
-	
+
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: printwigner
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Computes the continuous Wigner quasi-probability distribution $W(x,p)$ 
+  !>   to certify the non-classical nature of the emitted radiation. 
+  !>   
+  !>   Physics Context:
+  !>   Standard spontaneous emission yields a single photon (a ring in phase space). 
+  !>   At ultrastrong coupling, the emission becomes a Schrödinger cat. This 
+  !>   routine applies a spatial filter to project out the static dressing cloud, 
+  !>   defines an effective propagating bosonic mode, and evaluates the symmetrized 
+  !>   correlations. The presence of negative quasi-probabilities (interference 
+  !>   "whiskers" between two classical lobes) is the definitive signature of 
+  !>   the cat state.
+  !> Arguments:
+  !>   - filenb           : Fortran I/O unit number for data export.
+  !>   - sys              : Parameter structure.
+  !>   - st               : Multi-polaron state vector.
+  !>   - res              : Resolution multiplier for the phase-space grid.
+  !>   - xxminIN, xxmaxIN : Optional overrides for the spatial filtering window.
+  !>
 	SUBROUTINE printwigner(filenb,sys,st,res,xxminIN,xxmaxIN)
 		type(param), intent(in)						 	::  sys
 		type(state), intent(in) 		    				::  st
@@ -839,6 +990,18 @@ CONTAINS
 		end do
 	END SUBROUTINE
 
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: re_wignerise
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   A post-processing utility. Reconstructs a fully evolved multi-polaron 
+  !>   state directly from disk (loading $f_k, h_k, p, q$ via `initialise_from_file`) 
+  !>   to re-evaluate the Wigner function. This allows the user to perform 
+  !>   high-resolution phase-space scans on previously generated data without 
+  !>   having to re-run the expensive time-dependent Runge-Kutta integration.
+  !> Arguments:
+  !>   - sys : Parameter structure defining system size and target files.
+  !>
 	SUBROUTINE re_wignerise(sys) 
 		type(param), intent(in)			  	::  sys
 		type(state)						  		::  st

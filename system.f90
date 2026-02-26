@@ -1,30 +1,43 @@
-MODULE SYSTEM 
-!==============================================================================
-! MODULE SYSTEM
+! ==============================================================================
+!  MODULE: system.f90 (SYSTEM)
 !
-! Implements the time-dependent variational dynamics used in:
-!   N. Gheeraert et al., New J. Phys. 19 (2017) 023036.
+!  PURPOSE & CONTEXT
+!    Core physics engine and data structures for the time-dependent variational 
+!    simulation of spontaneous emission in waveguide QED at ultrastrong coupling.
+!    Generates the data underlying the time-domain results in:
+!      N. Gheeraert et al., "Spontaneous emission of Schrödinger cats in a 
+!      waveguide at ultrastrong coupling", New J. Phys. 19 (2017) 023036.
 !
-! Physics model (spin-boson / waveguide QED):
-!   A two-level system with tunneling Delta (called `del` here) coupled to a continuum
-!   of bosonic modes (the 1D waveguide). In second-quantized form:
-!       H = (Delta/2) sigma_x + Sum_k omega_k a_k^dagger a_k + (sigma_z/2) Sum_k g_k (a_k + a_k^dagger)
-!   The code uses a linear discretization of omega_k up to `wmax`, with an exponential
-!   cutoff `wc` in the coupling.
+!  PHYSICAL MODEL
+!    Spin-boson model in the continuum limit. A two-level system (qubit) with 
+!    tunneling splitting `del` is coupled to a 1D bosonic waveguide.
+!      H = (Δ/2)σ_z + Σ_k ω_k a_k^† a_k + (σ_x) Σ_k g_k (a_k + a_k^†)
+!    The coupling g_k enforces an Ohmic spectral density with an exponential cutoff.
 !
-! Variational ansatz (multi-coherent-state / multipolaron expansion):
-!   |Psi(t)> = Sum_{m=1}^{Ncs} [ p_m(t)|up>x|f_m(t)>  +  q_m(t)|down>x|h_m(t)> ]
-!   where |f_m> and |h_m> are multimode coherent states, parameterized by complex
-!   displacements f_{m,k} and h_{m,k}.
+!  CORE RESPONSIBILITIES
+!    1. Data Structures : Defines the Multi-Polaron Ansatz parameters (`state`).
+!    2. TDVP Evaluator  : Implements `CalcDerivatives`, which translates the 
+!                         Dirac-Frenkel variational principle into a solvable 
+!                         set of explicit Ordinary Differential Equations (ODEs).
+!    3. Tensor Algebra  : Implements the $O(N_{cs}^6)$ flattening trick (detailed 
+!                         in the paper's Appendix) to resolve the implicit 
+!                         dependence of $\dot{f}$ on $\kappa$.
+!    4. Memory Caching  : Precomputes non-orthogonal overlaps to drastically 
+!                         reduce integration bottleneck times.
 !
-! Numerical method:
-!   - Precompute coherent-state overlaps and mode sums entering the energy functional.
-!   - Derive Euler-Lagrange equations via the time-dependent variational principle.
-!   - Convert the implicit equations (where dotf appears on both sides through kappa) into an
-!     explicit form by solving a linear system for kappa (Appendix of the paper). This keeps
-!     the cost scaling as O(Ncs^6) instead of O(Nmodes*Ncs^3).
-!==============================================================================
+!  EXECUTION HIERARCHY (Integration Context)
+!      main.f90 
+!       ├── system:getParameters (initializes grid and Hamiltonian parameters)
+!       └── output:printTrajectory_HL 
+!            ├── system:allocate_state / initialise_vaccum (setup)
+!            └── output:evolveState_HL 
+!                 ├── output:Evolve_RK4 (integrator)
+!                 │    ├── system:update_sums (caches macroscopic overlaps)
+!                 │    └── system:CalcDerivatives (solves explicit TDVP EOMs)
+!                 └── system:Energy, error, sigmaZ, n_up_x (evaluates observables)
+! ==============================================================================
 
+MODULE SYSTEM 
 
 	USE consts
 	USE lapackmodule
@@ -34,7 +47,10 @@ MODULE SYSTEM
 	IMPLICIT NONE 
 
 !------------------------------------------------------------------------------
-! Simulation / model parameters (grid, Hamiltonian parameters, run control).
+! TYPE: param
+!   Central configuration object. Stores the discretized grid (k-space), the 
+!   Hamiltonian parameters (α, Δ, ω_c), and the dynamic run controls (time steps, 
+!   error thresholds for adaptive basis expansion).
 !------------------------------------------------------------------------------
 	TYPE param
 		integer    				 ::  npini
@@ -70,11 +86,12 @@ MODULE SYSTEM
 	END TYPE param
 
 !------------------------------------------------------------------------------
-! Variational state |Psi(t)> in multi-coherent-state form.
-!   - `np` is the current number of coherent states Ncs.
-!   - (p,f) describes the |up> branch, (q,h) the |down> branch.
-!   - Overlap and sum matrices are cached to avoid O(Nmodes) recomputation inside
-!     tight inner loops (energy, derivatives, observables).
+! TYPE: STATE
+!   The dynamic Variational Wavefunction |Psi(t)>. 
+!   Constructed as a superposition of N_{cs} multimode coherent states.
+!     |Psi(t)> = Σ [ p_m(t)|↑>⊗|f_m(t)>  +  q_m(t)|↓>⊗|h_m(t)> ]
+!   To avoid O(N_modes * N_cs^3) scaling in the tight RK4 inner loops, macroscopic 
+!   overlaps (ov_ff) and energy sums (bigW, bigL) are aggressively cached.
 !------------------------------------------------------------------------------
 	TYPE STATE
 		real(rl)					 	::  t 								!-- Time
@@ -83,7 +100,6 @@ MODULE SYSTEM
 		complex(cx), allocatable  ::  p(:),q(:)   					!-- probability amplitudes of the polarons
 		complex(cx), allocatable  ::  fdot(:,:),hdot(:,:)   		!-- the time derivatives
 		complex(cx), allocatable  ::  pdot(:),qdot(:)   			!-- the time derivatives
-		!-- for storing the large sums over k
 		complex(cx), allocatable  ::  ov_ff(:,:), ov_hh(:,:)  	!-- matrices of overlaps
 		complex(cx), allocatable  ::  ov_fh(:,:), ov_hf(:,:)  	!-- matrices of overlaps
 		complex(cx), allocatable  ::  bigW_f(:,:), bigW_h(:,:)  !-- Ws (as in the notes)
@@ -91,7 +107,9 @@ MODULE SYSTEM
 	END TYPE STATE
 
 !------------------------------------------------------------------------------
-! Trajectory container: time series of monitored observables.
+! TYPE: TRAJ
+!   Trajectory container. Buffers the time-series arrays for macroscopic 
+!   observables before they are flushed to disk to prevent I/O bottlenecking.
 !------------------------------------------------------------------------------
 	TYPE TRAJ
 		integer							::  i_time
@@ -106,15 +124,17 @@ MODULE SYSTEM
 
 CONTAINS
 
-	!== initialize the parameters and get those in the command line
-!------------------------------------------------------------------------------
-! getParameters
-!   Parse command-line arguments and build the discretized bosonic bath:
-!     - omega_k: linear frequency grid (midpoint rule).
-!     - g_k: coupling chosen to reproduce an Ohmic spectral density with
-!            exponential cutoff, J(omega) proportional to alpha omega e^{-omega/omegac}.
-!   Also sets thresholds used by the adaptive 'add coherent state' strategy.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: getParameters
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Parses the command line to populate the `sys` object. Crucially, it 
+  !>   initializes the discretized Ohmic bath parameters. The coupling array `g_k` 
+  !>   is strictly scaled so that the macroscopic spectral density $J(\omega)$ 
+  !>   reproduces the continuum limit: $J(\omega) \propto \alpha \omega e^{-\omega/\omega_c}$.
+  !> Arguments:
+  !>   - sys : Parameter structure to be populated.
+  !>
 	SUBROUTINE getParameters(sys)
 		type(param)           			  ::  sys
 		type(state)           	     	  ::  st
@@ -220,7 +240,7 @@ CONTAINS
 					call get_command_argument(i+1, buffer)
 					read(buffer,*) sys%tmax
 				else if(buffer=='-tref')then 
-					call get_command_argument(i+1, buffer)
+				    call get_command_argument(i+1, buffer)
 					read(buffer,*) sys%tref
 				else if(buffer=='-xmin')then 
 					call get_command_argument(i+1, buffer)
@@ -282,12 +302,19 @@ CONTAINS
 		sys%dx  = sys%length/sys%nmode
 	END SUBROUTINE  
 
-	!== Initialisation routines
-!------------------------------------------------------------------------------
-! allocate_state
-!   Allocate a `state` structure for Ncs coherent states and Nmodes bath modes.
-!   Called both at initialization and when a new coherent state (polaron) is added.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: allocate_state
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Dynamically allocates memory for the complex arrays constituting the 
+  !>   multi-polaron ansatz. It is called both at initialization and dynamically 
+  !>   during RK4 execution whenever the Dirac-Frenkel error mandates basis 
+  !>   expansion (increasing `np`).
+  !> Arguments:
+  !>   - sys     : Parameter structure providing grid dimensions.
+  !>   - st      : State object to be allocated.
+  !>   - npvalue : Optional override for the target basis dimension.
+  !>
 	SUBROUTINE allocate_state(sys,st,npvalue)
 		type(param), intent(in)      	::  sys
 		type(state), intent(out)  		::  st
@@ -349,11 +376,17 @@ CONTAINS
 
 	END SUBROUTINE
 
-!------------------------------------------------------------------------------
-! allocate_trajectory
-!   Allocate arrays used to store the time evolution of observables (energy, norm,
-!   spin components, error estimator, ...).
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: allocate_trajectory
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Allocates the contiguous memory buffers for the logging trajectory. 
+  !>   Sized slightly larger (1.5x) than the raw `tmax / dt` limit to safely 
+  !>   accommodate potential variable-timestep rewinds triggered by `checkTimestep`.
+  !> Arguments:
+  !>   - sys : Parameter structure.
+  !>   - tr  : Trajectory object to be allocated.
+  !>
 	SUBROUTINE allocate_trajectory(sys,tr)
 		type(param), intent(in)      	::  sys
 		type(traj), intent(out)      	::  tr
@@ -389,12 +422,19 @@ CONTAINS
 		end if
 	END SUBROUTINE
 
-!------------------------------------------------------------------------------
-! initialise_vaccum
-!   Build the initial variational state at time `time_in` with the bath in vacuum
-!   (all coherent displacements set to zero) and the spin prepared according to
-!   `sys%prep` (up, down, or superposition).
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: initialise_vaccum
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Constructs the initial $t=0$ boundary condition. The bosonic field is 
+  !>   forced strictly to the global vacuum (all displacement arrays zeroed), 
+  !>   while the atomic system is pumped into the specified initial configuration 
+  !>   (e.g., fully excited `prep=2`) to begin spontaneous emission.
+  !> Arguments:
+  !>   - sys     : Parameter structure.
+  !>   - st      : State object to initialize.
+  !>   - time_in : The initialization time (usually 0.0).
+  !>
 	SUBROUTINE initialise_vaccum(sys,st,time_in)
 		type(param), intent(in)      	::  sys
 		type(state), intent(in out) 	 	::  st
@@ -443,6 +483,18 @@ CONTAINS
 		CALL normalise(st)
 	END SUBROUTINE
 
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: initialise_from_file
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Post-processing and restart utility. Directly loads a previously evolved 
+  !>   multi-polaron state ($\mathbf{f}, \mathbf{h}, p, q$) from the exported 
+  !>   ASCII files. This allows the user to re-evaluate expensive spatial 
+  !>   diagnostics (like the 2D Wigner tomography) without re-integrating the EOMs.
+  !> Arguments:
+  !>   - sys : Parameter structure governing filenames.
+  !>   - st  : Target state to be overwritten with disk data.
+  !>
 	SUBROUTINE initialise_from_file(sys,st)
 		type(param), intent(in)			  	::  sys
 		type(state), intent(in out)	  		::  st
@@ -493,6 +545,19 @@ CONTAINS
 		CALL normalise(st)
 	END SUBROUTINE
 
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: parameterchar
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Standardized file-tagging utility. Concatenates the critical physical 
+  !>   and numerical parameters (α, Δ, error thresholds, grid cuts) into a 
+  !>   unique string. Prevents collision and overwriting during cluster parameter 
+  !>   sweeps.
+  !> Arguments:
+  !>   - sys : Parameter structure.
+  !> Return:
+  !>   - character(len=100) : The formatted signature string.
+  !>
 	FUNCTION parameterchar(sys)
 		type(param), intent(in)		::   sys
 		character(len=100)      		:: delchar,alChar,npiniChar,nmChar,npaddChar,&
@@ -538,6 +603,19 @@ CONTAINS
 			"_p"//trim(adjustl(prepchar))
 	END FUNCTION
 
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: gs_filename
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Returns the expected filename for the pre-calculated dressed ground state. 
+  !>   Because the USC vacuum contains virtual photons, several scattering 
+  !>   preparations require loading this state to properly isolate the scattered 
+  !>   wavepacket from the bound dressing cloud.
+  !> Arguments:
+  !>   - sys     : Parameter structure.
+  !>   - st      : Current state (determines the required polaron count).
+  !>   - path_in : Optional base directory override.
+  !>
 	FUNCTION gs_filename(sys,st,path_in)
 		type(param), intent(in)   		::  sys
 		type(state), intent(in)			::  st
@@ -564,18 +642,27 @@ CONTAINS
 			"_wm"//trim(adjustl(wmchar))//"_wc"//trim(adjustl(wcchar))//".d"
 	END FUNCTION
 
-	!=======================================
-	!== Calculation of the derivatives
-	!======================================
-!------------------------------------------------------------------------------
-! CalcDerivatives(sys, st)
-!   Core routine: compute time derivatives (pdot,qdot,fdot,hdot) from the explicit
-!   variational equations of motion (TDVP).
-!
-!   The multi-coherent-state equations are implicit because kappa_{m,j} depends on dotf.
-!   Following the Appendix of the paper, the code builds a linear system for kappa and
-!   solves it (here via `directInverse`) to obtain an explicit dotf = F[v].
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: CalcDerivatives
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   THE CORE PHYSICS ENGINE. This routine solves the highly non-linear, 
+  !>   implicit Euler-Lagrange equations derived from the Time-Dependent 
+  !>   Variational Principle (TDVP).
+  !>   
+  !>   Methodology (Ref: Appendix of 2017 Paper):
+  !>   The exact functional derivative yields implicit equations where $\dot{f}$ 
+  !>   appears on both the LHS and within the $\kappa$ overlap matrices on the RHS. 
+  !>   To resolve this, the routine algebraically maps the tensor overlaps into a 
+  !>   linear system $\mathbf{A}_{2D} \cdot \vec{X} = \vec{B}$. 
+  !>   By flattening the indices and solving this system via LAPACK `directInverse`, 
+  !>   it extracts the explicit derivatives $\dot{p}, \dot{q}, \dot{f}, \dot{h}$. 
+  !>   This mapping reduces the computational complexity from an intractable 
+  !>   $O(N_{modes} \times N_{cs}^3)$ to $O(N_{cs}^6)$, enabling continuum simulation.
+  !> Arguments:
+  !>   - sys : Parameter structure.
+  !>   - st  : Current state (in), returns updated time derivatives (out).
+  !>
 	SUBROUTINE CalcDerivatives(sys,st)
 		type(param), intent(in)                         :: sys
 		type(state), intent(in out)                     :: st
@@ -709,7 +796,21 @@ CONTAINS
 	END SUBROUTINE
 
 
-	!-- Derivatives of E with respect to sepcified variable STARRED
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: P_j, Q_j, F_j, H_j
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   These four functions evaluate the raw local gradients of the total system 
+  !>   energy with respect to the complex conjugate of the variational parameters 
+  !>   ($\partial E / \partial p^*_j$, etc.). They form the foundational Right-Hand 
+  !>   Side driving terms for the EOMs prior to the $\kappa$-tensor inversion.
+  !> Arguments:
+  !>   - sys : Parameter structure.
+  !>   - st  : Current state.
+  !>   - m/j : The specific polaron index being evaluated.
+  !> Return:
+  !>   - complex(cx) : Evaluated derivative vector/scalar.
+  !>
 	FUNCTION P_j(sys,st,m)
 
 		type(param),intent(in)         ::  sys
@@ -781,14 +882,20 @@ CONTAINS
 
 	END FUNCTION
 
-!------------------------------------------------------------------------------
-! update_sums
-!   Recompute all cached overlap matrices and the 'big sums' over modes:
-!     ov_ff(m,n) = <f_m|f_n>,  ov_hh(m,n) = <h_m|h_n>, etc.
-!     bigW_f(m,n) = Sum_k omega_k f*_m,k f_n,k
-!     bigL_f(m,n) = Sum_k g_k (f*_m,k + f_n,k)
-!   These objects appear repeatedly in the variational equations and observables.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: update_sums
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Critical performance optimizer. The coherent states are non-orthogonal, 
+  !>   meaning their inner products $\langle f_i | f_j \rangle$ appear everywhere 
+  !>   in the energy landscape. By pre-computing these macroscopic overlaps and 
+  !>   the free/interaction energy projections (the `bigW` and `bigL` matrices) 
+  !>   once per RK4 step, it prevents the $O(N_{cs}^3)$ derivative loops from 
+  !>   having to iterate over the massive momentum grid ($N_{modes}$).
+  !> Arguments:
+  !>   - sys : Parameter structure.
+  !>   - st  : Target state (caches updated in-place).
+  !>
 	SUBROUTINE update_sums(sys,st)
 
 		type(param),intent(in)			::  sys
@@ -824,12 +931,23 @@ CONTAINS
 	!== State functions
 	!======================================
 
-!------------------------------------------------------------------------------
-! Energy(sys, st)
-!   Evaluate the variational energy functional E[Psi] = <Psi|H|Psi> using the cached
-!   overlaps and mode sums. This is the quantity whose gradients generate the
-!   Euler-Lagrange equations for (p,q,f,h).
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: Energy
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Evaluates the total variational energy functional $E[\Psi] = \langle \Psi | H | \Psi \rangle$. 
+  !>   This is the central quantity minimized by the Dirac-Frenkel
+  !>   Time-Dependent Variational Principle (TDVP). It sums the bare atomic energy, 
+  !>   the free-field bosonic energy (via `bigW`), and the spin-boson dipole 
+  !>   interaction energy (via `bigL`). Because the coherent states are non-orthogonal, 
+  !>   every term is weighted by the complex cross-overlaps.
+  !> Arguments:
+  !>   - sys : Parameter structure (provides $\Delta$).
+  !>   - st  : Current multi-polaron state object.
+  !> Return:
+  !>   - real(rl) : The exact expectation value of the Hamiltonian. Throws a 
+  !>                warning if numerical instability produces an imaginary component.
+  !>
 	FUNCTION Energy(sys,st)
 		type(param),intent(in)         				::  sys
 		type(state),intent(in)         				::  st
@@ -858,6 +976,20 @@ CONTAINS
 		energy = real(tmp,KIND=8)
 
 	END FUNCTION
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: norm
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Computes the overall $L^2$ norm of the multi-polaron state, $\langle \Psi | \Psi \rangle$, 
+  !>   to verify total probability conservation. It evaluates the double sum over 
+  !>   all coherent state cross-terms, factoring in both the atomic spin amplitudes 
+  !>   (`p`, `q`) and the bosonic inner products (`ov_ff`, `ov_hh`).
+  !> Arguments:
+  !>   - st : Current state object to evaluate.
+  !> Return:
+  !>   - real(rl) : The scalar norm of the variational wavefunction.
+  !>
 	FUNCTION norm(st)
 
 		real(rl) 			       		::  norm
@@ -877,6 +1009,19 @@ CONTAINS
 		norm = sqrt(tmp)
 
 	END FUNCTION
+
+  !> -------------------------------------------------------------------------
+  !> SUBROUTINE: normalise
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Enforces strict probability conservation. Evaluates the instantaneous 
+  !>   state norm and scales the complex atomic probability amplitudes (`p` and `q`) 
+  !>   to restore $\langle \Psi | \Psi \rangle = 1$. The bosonic displacement arrays 
+  !>   (`f`, `h`) are left untouched, as scaling them would unphysically alter 
+  !>   the photon number rather than the overall state weight.
+  !> Arguments:
+  !>   - st : Target state to be normalized in-place.
+  !>
 	SUBROUTINE normalise(st)
 
 		type(state), intent(in out)  ::  st
@@ -888,13 +1033,29 @@ CONTAINS
 		st%q = st%q/normval
 
 	END SUBROUTINE
-!------------------------------------------------------------------------------
-! error(sys, ost, st)
-!   Error estimator Err(t) used in the paper: squared norm of the auxiliary state
-!     |Phi(t)> = (i d/d_t - H) |Psi(t)>
-!   which vanishes for the exact Schrodinger dynamics. In practice, this provides a
-!   convergence / adaptivity criterion to decide whether to add a new coherent state.
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: error
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   The adaptive trigger for basis expansion. Calculates the McLachlan 
+  !>   variational error metric, defined as the squared distance between the 
+  !>   exact Schrödinger evolution and the restricted TDVP trajectory: 
+  !>   $Err = || (i \partial_t - H)|\Psi(t)\rangle ||^2$. 
+  !>   
+  !>   Physics Context:
+  !>   In the ultrastrong coupling regime, inelastic scattering produces highly 
+  !>   entangled, non-Gaussian multi-photon states (Schrödinger cats). When the 
+  !>   current basis dimension ($N_{cs}$) can no longer capture this complexity, 
+  !>   this error diverges. The main loop monitors this function and injects 
+  !>   a new polaron when the threshold is breached.
+  !> Arguments:
+  !>   - sys  : Parameter structure.
+  !>   - rost : Unused/legacy variable (historically $t-2dt$).
+  !>   - st   : Current state object at time $t$.
+  !> Return:
+  !>   - complex(cx) : The complex error magnitude (imaginary part should be 0).
+  !>
 	FUNCTION error(sys,rost,st)
 
 		type(param),intent(in)		::  sys
@@ -1002,13 +1163,20 @@ CONTAINS
 
 	END FUNCTION	
 
-	!-- Calculate the overlap between two coherent states
-!------------------------------------------------------------------------------
-! ov_states
-!   Coherent-state overlap(s): for multimode coherent states |alpha> and |beta>:
-!     <alpha|beta> = exp( -|alpha|^2/2 - |beta|^2/2 + alpha*.beta ).
-!   These overlaps define the metric on the variational manifold.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: ov_states
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Computes the full macroscopic quantum overlap between two entirely 
+  !>   separate multi-polaron states, $\langle \Psi_1 | \Psi_2 \rangle$. Useful 
+  !>   for calculating fidelities, transition probabilities, or verifying 
+  !>   orthogonality between scattered wavepackets and the bound ground state.
+  !> Arguments:
+  !>   - st1 : First (bra) state object.
+  !>   - st2 : Second (ket) state object.
+  !> Return:
+  !>   - complex(cx) : The complex scalar inner product.
+  !>
 	FUNCTION ov_states(st1,st2)
 
 		type(state), intent(in)  ::  st1,st2
@@ -1028,12 +1196,20 @@ CONTAINS
 		ov_states = tmp
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! ov_scalar
-!   Coherent-state overlap(s): for multimode coherent states |alpha> and |beta>:
-!     <alpha|beta> = exp( -|alpha|^2/2 - |beta|^2/2 + alpha*.beta ).
-!   These overlaps define the metric on the variational manifold.
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: ov_scalar
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Evaluates the fundamental inner product between two scalar (single-mode) 
+  !>   coherent states $|\alpha\rangle$ and $|\beta\rangle$. 
+  !>   Formula: $\exp( -0.5|\alpha|^2 - 0.5|\beta|^2 + \alpha^* \beta )$.
+  !> Arguments:
+  !>   - f1 : First scalar complex amplitude ($\alpha$).
+  !>   - f2 : Second scalar complex amplitude ($\beta$).
+  !> Return:
+  !>   - complex(cx) : The non-orthogonal overlap scalar.
+  !>
 	FUNCTION ov_scalar(f1,f2)
 
 		complex(cx), intent(in) :: f1, f2
@@ -1047,12 +1223,22 @@ CONTAINS
 		ov_scalar = exp( -0.5_rl*tmp1 - 0.5_rl*tmp2 + tmp3 ) 
 
 	END FUNCTION	ov_scalar
-!------------------------------------------------------------------------------
-! ov
-!   Coherent-state overlap(s): for multimode coherent states |alpha> and |beta>:
-!     <alpha|beta> = exp( -|alpha|^2/2 - |beta|^2/2 + alpha*.beta ).
-!   These overlaps define the metric on the variational manifold.
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: ov
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Generalizes the coherent state overlap to the continuous multi-mode 
+  !>   waveguide. Computes the macroscopic overlap between two displacement 
+  !>   fields by taking the dot product across the entire momentum grid $k$. 
+  !>   This is the core mathematical object that dictates the metric tensor 
+  !>   of the variational manifold.
+  !> Arguments:
+  !>   - f1 : First continuous momentum array (bra).
+  !>   - f2 : Second continuous momentum array (ket).
+  !> Return:
+  !>   - complex(cx) : The total macroscopic overlap.
+  !>
 	FUNCTION ov(f1,f2)
 
 		complex(cx), intent(in) :: f1( : ), f2( : )
@@ -1079,7 +1265,19 @@ CONTAINS
 
 	END FUNCTION	ov
 
-	!-- Probability of being in the up or down state
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: upProb
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Calculates the reduced density matrix probability of finding the artificial 
+  !>   atom in the excited $|\uparrow\rangle$ state. It traces out the bosonic 
+  !>   environment by summing the squared atomic amplitudes (`p`), weighted by 
+  !>   their associated multi-mode bosonic overlaps (`ov_ff`).
+  !> Arguments:
+  !>   - st : Current state object to evaluate.
+  !> Return:
+  !>   - real(rl) : The spin-up probability (0.0 to 1.0).
+  !>
 	FUNCTION upProb(st)
 
 		real(rl) 			       		::  upProb
@@ -1095,6 +1293,19 @@ CONTAINS
 		end do
 
 	END FUNCTION
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: downProb
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Calculates the reduced density matrix probability of finding the artificial 
+  !>   atom in the ground $|\downarrow\rangle$ state. Traces out the bosonic 
+  !>   environment by evaluating the `q` amplitudes and the `ov_hh` cross-overlaps.
+  !> Arguments:
+  !>   - st : Current state object to evaluate.
+  !> Return:
+  !>   - real(rl) : The spin-down probability (0.0 to 1.0).
+  !>
 	FUNCTION downProb(st)
 
 		real(rl) 			       		::  downProb
@@ -1111,11 +1322,20 @@ CONTAINS
 
 	END FUNCTION
 
-	!-- Expectation value of sigmaX
-!------------------------------------------------------------------------------
-! sigmaX(st)
-!   Spin expectation value computed with the non-orthogonal coherent-state basis.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: sigmaX
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Computes the expectation value of the Pauli X operator, $\langle \sigma_x \rangle$. 
+  !>   Because $\sigma_x$ flips the atomic spin, this evaluates the off-diagonal 
+  !>   coherences between the "up" (`p`) and "down" (`q`) manifolds, weighted 
+  !>   by the corresponding cross-branch bosonic overlaps (`ov_fh` and `ov_hf`). 
+  !>   Crucial for tracking tunneling dynamics driven by $\Delta$.
+  !> Arguments:
+  !>   - st : Current state object to evaluate.
+  !> Return:
+  !>   - real(rl) : The expectation value of $\sigma_x$.
+  !>
 	FUNCTION sigmaX(st)
 
 		type(state), intent(in)  :: st
@@ -1135,10 +1355,21 @@ CONTAINS
 		sigmaX = real(tmp)
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! sigmaZ(st)
-!   Spin expectation value computed with the non-orthogonal coherent-state basis.
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: sigmaZ
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Computes the expectation value of the Pauli Z operator, $\langle \sigma_z \rangle$, 
+  !>   representing the atomic population inversion. Evaluated simply as the 
+  !>   difference between the spin-up and spin-down reduced probabilities.
+  !>   In the USC regime, the true ground state is dressed, meaning $\langle \sigma_z \rangle$ 
+  !>   will not perfectly reach -1 even after full spontaneous emission.
+  !> Arguments:
+  !>   - st : Current state object to evaluate.
+  !> Return:
+  !>   - real(rl) : The expectation value of $\sigma_z$ (ranges from -1 to 1).
+  !>
 	FUNCTION sigmaZ(st)
 
 		type(state), intent(in)  :: st
@@ -1148,10 +1379,20 @@ CONTAINS
 		sigmaZ = upProb(st) - downProb(st)
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! sigmaY(st)
-!   Spin expectation value computed with the non-orthogonal coherent-state basis.
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: sigmaY
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Computes the expectation value of the Pauli Y operator, $\langle \sigma_y \rangle$. 
+  !>   Similar to $\sigma_x$, it evaluates the off-diagonal coherences between 
+  !>   the atomic manifolds, but applies the appropriate complex $\pm i$ phase 
+  !>   factor during the bosonic trace.
+  !> Arguments:
+  !>   - st : Current state object to evaluate.
+  !> Return:
+  !>   - real(rl) : The expectation value of $\sigma_y$.
+  !>
 	FUNCTION sigmaY(st)
 
 		type(state), intent(in)  :: st
@@ -1171,19 +1412,23 @@ CONTAINS
 
 	END FUNCTION
 
-	!======================================================
-	!== INTERPOLATION ROUTINES
-	!======================================================
-
-	!======================================================
-	!== HALF LINE FUNCITONS
-	!======================================================
-!------------------------------------------------------------------------------
-! f_nk_FT
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: f_nk_FT
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   A specialized spatial windowing and Fourier Transform utility. 
+  !>   To analyze the emitted Schrödinger cat state without interference from 
+  !>   the virtual photons dressing the atom, this function applies a spatial 
+  !>   cutoff (`xmin`, `xmax`) to isolate the freely propagating wavepacket. 
+  !>   It then transforms the filtered real-space data back into the momentum 
+  !>   domain to extract the true emission spectrum.
+  !> Arguments:
+  !>   - sys        : Parameter structure defining the grids.
+  !>   - fnx        : The real-space amplitude array to be filtered.
+  !>   - xmin, xmax : Optional spatial boundaries to isolate the propagating cat.
+  !> Return:
+  !>   - complex(cx) : The filtered, momentum-space amplitude array.
+  !>
 	FUNCTION f_nk_FT(sys,fnx,xmin,xmax)
 
 		type(param),intent(in)   						::  sys
@@ -1215,12 +1460,21 @@ CONTAINS
 
 	END FUNCTION
 
-!------------------------------------------------------------------------------
-! n_up_k
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: n_up_k
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Calculates the momentum-space photon number spectrum $n(k)$ strictly 
+  !>   projected onto the artificial atom's excited $|\uparrow\rangle$ state. 
+  !>   It collapses the "down" amplitudes to zero, normalizes the subspace, 
+  !>   and evaluates the expectation value of the photon number operator.
+  !> Arguments:
+  !>   - sys : Parameter structure.
+  !>   - st  : Current multi-polaron state.
+  !>   - i   : The specific momentum grid index ($k_i$) to evaluate.
+  !> Return:
+  !>   - real(rl) : The spin-projected photon density at mode $i$.
+  !>
 	FUNCTION n_up_k(sys,st,i)
 
 		type(state), intent(in)   						::  st
@@ -1248,12 +1502,22 @@ CONTAINS
 		n_up_k = real( tmp )
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! n_up_x
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: n_up_x
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Calculates the spatially integrated, real-space photon density conditioned 
+  !>   on the atom being in the $|\uparrow\rangle$ state. It accepts spatial 
+  !>   windowing arguments to specifically quantify the macroscopic photon content 
+  !>   of the propagating wavepacket branch associated with the excited atom.
+  !> Arguments:
+  !>   - sys        : Parameter structure.
+  !>   - st         : Current state.
+  !>   - xmin, xmax : Optional spatial bounds.
+  !> Return:
+  !>   - real(rl) : Total projected macroscopic photon count in the spatial window.
+  !>
 	FUNCTION n_up_x(sys,st,xmin,xmax)
 
 		type(state), intent(in)   						::  st
@@ -1295,12 +1559,19 @@ CONTAINS
 		n_up_x = real( tmp )
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! n_up
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: n_up
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Calculates the total macroscopic number of photons associated exclusively 
+  !>   with the qubit "up" state across the entire unwindowed waveguide.
+  !> Arguments:
+  !>   - sys : Parameter structure.
+  !>   - st  : Current state.
+  !> Return:
+  !>   - real(rl) : Total integrated photon count in the "up" subspace.
+  !>
 	FUNCTION n_up(sys,st)
 
 		type(state), intent(in)   						::  st
@@ -1329,12 +1600,21 @@ CONTAINS
 
 	END FUNCTION
 
-!------------------------------------------------------------------------------
-! f_k
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: f_k / h_k
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Extracts the effective global momentum-space probability amplitude for 
+  !>   a specific mode `k` within the atomic "up" (`f_k`) or "down" (`h_k`) manifold. 
+  !>   It properly traces over the non-orthogonal multi-polaron superposition, 
+  !>   weighting the individual coherent displacements by their atomic amplitudes 
+  !>   and bosonic overlaps.
+  !> Arguments:
+  !>   - st : Current state.
+  !>   - k  : Momentum grid index.
+  !> Return:
+  !>   - complex(cx) : The total coherent amplitude at mode `k`.
+  !>
 	FUNCTION f_k(st,k)
 
 		type(state), intent(in)  ::  st
@@ -1350,12 +1630,6 @@ CONTAINS
 		end do
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! h_k
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
 	FUNCTION h_k(st,k)
 
 		type(state), intent(in)  ::  st
@@ -1372,12 +1646,22 @@ CONTAINS
 		end do
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! f_x
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: f_nx / h_nx
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   High-performance bulk real-space transforms. Rather than evaluating the 
+  !>   global field at a single point, these functions take the raw momentum 
+  !>   matrices (`f`, `h`) and transform the entirety of all constituent polarons 
+  !>   onto the discretized spatial grid simultaneously. Essential for calculating 
+  !>   the Wigner function and the spatially-resolved photon density $n(x)$.
+  !> Arguments:
+  !>   - sys : Parameter structure (defines the spatial bounds and grid `dx`).
+  !>   - st  : Current state.
+  !> Return:
+  !>   - complex(cx) : 2D array of real-space fields (N_cs $\times$ N_modes).
+  !>
 	FUNCTION f_x(sys,st,x)
 
 		type(param), intent(in)  ::  sys
@@ -1392,12 +1676,6 @@ CONTAINS
 		end do
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! h_x
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
 	FUNCTION h_x(sys,st,x)
 
 		type(param), intent(in)  ::  sys
@@ -1412,12 +1690,22 @@ CONTAINS
 		end do
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! f_nx
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
+
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: f_nx / h_nx
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   High-performance bulk real-space transforms. Rather than evaluating the 
+  !>   global field at a single point, these functions take the raw momentum 
+  !>   matrices (`f`, `h`) and transform the entirety of all constituent polarons 
+  !>   onto the discretized spatial grid simultaneously. Essential for calculating 
+  !>   the Wigner function and the spatially-resolved photon density $n(x)$.
+  !> Arguments:
+  !>   - sys : Parameter structure (defines the spatial bounds and grid `dx`).
+  !>   - st  : Current state.
+  !> Return:
+  !>   - complex(cx) : 2D array of real-space fields (N_cs $\times$ N_modes).
+  !>
 	FUNCTION f_nx(sys,st)
 
 		type(param),intent(in)   						::  sys
@@ -1436,12 +1724,6 @@ CONTAINS
 
 
 	END FUNCTION
-!------------------------------------------------------------------------------
-! h_nx
-!   Convenience observable: convert the coherent-state parameters into physical
-!   bath observables (k-space or x-space) such as photon density n(k), field envelope
-!   f(x), etc., for plotting the emitted wavepacket / cat state.
-!------------------------------------------------------------------------------
 	FUNCTION h_nx(sys,st)
 
 		type(param),intent(in)   						::  sys
@@ -1461,10 +1743,16 @@ CONTAINS
 
 	END FUNCTION
 
-	!======================================================
-	!== MATH FUNCTIONS
-	!======================================================
-
+  !> -------------------------------------------------------------------------
+  !> FUNCTION: factorial
+  !> -------------------------------------------------------------------------
+  !> Purpose / context:
+  !>   Standard mathematical utility calculating the integer factorial $n!$.
+  !> Arguments:
+  !>   - n : Input integer.
+  !> Return:
+  !>   - integer : The factorial result.
+  !>
 	FUNCTION factorial(n)
 
 		integer, intent(in)		::  n
@@ -1482,374 +1770,3 @@ CONTAINS
 
 
 END MODULE SYSTEM
-
-!	FUNCTION error_OLD(sys,oost,ost,st)
-!
-!		type(param),intent(in)		::  sys
-!		type(state),intent(in) 	::  oost,ost,st
-!		complex(cx)					::  tmp1,tmp2, tmp3, tmp4
-!		complex(cx)	   			::  error_OLD
-!		complex(cx), dimension(ost%np,sys%nmode)  ::  off, ohh, ofh, ohf,ofdd,ohdd
-!		complex(cx), dimension(ost%np)  ::  opdd,oqdd
-!		integer					   	::  i,j
-!
-!		tmp1 = 0._cx
-!		tmp2 = 0._cx
-!		tmp3 = 0._cx
-!		tmp4 = 0._cx
-!		error_OLD = 0._cx
-!
-!		ofdd(:,:) = (st%fdot(:,:) - oost%fdot(:,:))/(st%t-oost%t)
-!		ohdd(:,:) = (st%hdot(:,:) - oost%hdot(:,:))/(st%t-oost%t)
-!		opdd(:) = (st%pdot(:) - oost%pdot(:))/(st%t-oost%t)
-!		oqdd(:) = (st%qdot(:) - oost%qdot(:))/(st%t-oost%t)
-!
-!		do i=1, size(st%f,1)
-!			do j=1, size(ost%f,1)
-!				off(i,j) = dot_product( ost%fdot(i,:) , ost%f(j,:) )
-!				ohh(i,j) = dot_product( ost%hdot(i,:) , ost%h(j,:) )
-!				ofh(i,j) = dot_product( ost%fdot(i,:) , ost%h(j,:) )
-!				ohf(i,j) = dot_product( ost%hdot(i,:) , ost%f(j,:) )
-!			end do
-!		end do
-!
-!		tmp3 = tmp3 + 0.25_rl*sys%del**2 + 0.25_rl*sum(sys%g(:)*sys%g(:))
-!
-!		do i=1,ost%np
-!			do j=1,ost%np
-!
-!				tmp1 = tmp1 + ost%ov_ff(i,j)*( &
-!					+ conjg(ost%pdot(i))*ost%pdot(j) - 0.5_rl*conjg(ost%pdot(i))*ost%p(j)*( conjg(off(j,j)) + off(j,j) - 2_rl*conjg(off(j,i)) )&
-!					- 0.5_rl*conjg(ost%p(i))*ost%pdot(j)*( conjg(off(i,i)) + off(i,i) - 2_rl*off(i,j) ) &
-!					+ 0.25_rl*conjg(ost%p(i))*ost%p(j)*( (conjg(off(i,i))+off(i,i))*( conjg(off(j,j)) + off(j,j) - 2_rl*conjg(off(j,i))) &
-!					- 2_rl*off(i,j)*( conjg(off(j,j)) + off(j,j) ) &
-!					+ 4_rl*( off(i,j)*conjg(off(j,i)) + sum(conjg(ost%fdot(i,:))*ost%fdot(j,:)) ) ) )
-!
-!				tmp2 = tmp2 + ost%ov_ff(i,j)*ost%p(j)* ( &
-!					( conjg(ost%pdot(i)) - 0.5_rl*conjg(ost%p(i))*(conjg(off(i,i)) + off(i,i)) )*( ost%bigW_f(i,j) &
-!					- 0.5_rl*ost%bigL_f(i,j) ) &
-!					+ conjg(ost%p(i))*off(i,j)*( ost%bigW_f(i,j) - 0.5_rl*ost%bigL_f(i,j) ) &
-!					+ conjg(ost%p(i))*sum( sys%w(:)*conjg(ost%fdot(i,:))*ost%f(j,:) - 0.5_rl*conjg(ost%fdot(i,:))*sys%g(:)) ) &
-!					+ 0.5_rl*sys%del*ost%q(j)*ost%ov_fh(i,j)*( conjg(ost%pdot(i)) & 
-!					- 0.5_rl*conjg(ost%p(i))*( conjg(off(i,i)) + off(i,i) - 2_rl*ofh(i,j) ) )
-!
-!
-!				tmp3 = tmp3 + conjg(ost%p(i))*ost%p(j)*ost%ov_ff(i,j)*( sum( sys%w(:)*sys%w(:)*conjg(ost%f(i,:))*ost%f(j,:) ) &
-!					+ (ost%bigW_f(i,j))**2 &
-!					+ 0.25_rl*(ost%bigL_f(i,j))**2 &
-!					- 0.5_rl*sum( sys%g(:)*sys%w(:)*(conjg(ost%f(i,:)) + ost%f(j,:)) ) &
-!					- ost%bigL_f(i,j)*ost%bigW_f(i,j) ) &
-!					+ sys%del*conjg(ost%p(i))*ost%q(j)*ost%ov_fh(i,j)*sum( sys%w(:)*conjg(ost%f(i,:))*ost%h(j,:) )
-!
-!				tmp4 = tmp4 + conjg(ost%p(j))*ost%ov_ff(j,i)*( &
-!					+ opdd(i) &
-!					- ost%pdot(i)*( off(i,i) + conjg(off(i,i)) - 2_rl*conjg(off(i,j)) ) &
-!					- 0.5_rl*ost%p(i)*( sum( 2_rl*real(conjg(ofdd(i,:))*ost%f(i,:)) &
-!					+ 2_rl*conjg(ost%fdot(i,:))*ost%fdot(i,:) &
-!					- 2_rl*ofdd(i,:)*conjg(ost%f(j,:)) ) ) &
-!					+ 0.25_rl*ost%p(i)*( off(i,i) + conjg(off(i,i)) - 2_rl*conjg(off(i,j)) )**2 &
-!					)
-!
-!
-!				!-- the q and h parts 
-!
-!				tmp1 = tmp1 + ost%ov_hh(i,j)*( &
-!					+ conjg(ost%qdot(i))*ost%qdot(j) - 0.5_rl*conjg(ost%qdot(i))*ost%q(j)*( conjg(ohh(j,j)) + ohh(j,j) - 2_rl*conjg(ohh(j,i)) )&
-!					- 0.5_rl*conjg(ost%q(i))*ost%qdot(j)*( conjg(ohh(i,i)) + ohh(i,i) - 2_rl*ohh(i,j) ) &
-!					+ 0.25_rl*conjg(ost%q(i))*ost%q(j)*( (conjg(ohh(i,i))+ohh(i,i))*( conjg(ohh(j,j)) + ohh(j,j) - 2_rl*conjg(ohh(j,i))) &
-!					- 2_rl*ohh(i,j)*( conjg(ohh(j,j)) + ohh(j,j) ) &
-!					+ 4_rl*( ohh(i,j)*conjg(ohh(j,i)) + sum(conjg(ost%hdot(i,:))*ost%hdot(j,:)) ) ) )
-!
-!
-!				tmp2 = tmp2 + ost%ov_hh(i,j)*ost%q(j)* ( &
-!					( conjg(ost%qdot(i)) - 0.5_rl*conjg(ost%q(i))*(conjg(ohh(i,i)) + ohh(i,i)) )*( ost%bigW_h(i,j) &
-!					- 0.5_rl*(-ost%bigL_h(i,j)) ) &
-!					+ conjg(ost%q(i))*ohh(i,j)*( ost%bigW_h(i,j) - 0.5_rl*(-ost%bigL_h(i,j)) ) &
-!					+ conjg(ost%q(i))*sum( sys%w(:)*conjg(ost%hdot(i,:))*ost%h(j,:) - 0.5_rl*conjg(ost%hdot(i,:))*(-sys%g(:)) ) ) &
-!					+ 0.5_rl*sys%del*ost%p(j)*ost%ov_hf(i,j)*( conjg(ost%qdot(i)) & 
-!					- 0.5_rl*conjg(ost%q(i))*( conjg(ohh(i,i)) + ohh(i,i) - 2_rl*ohf(i,j) ) )
-!
-!				tmp3 = tmp3 + conjg(ost%q(i))*ost%q(j)*ost%ov_hh(i,j)*( sum( sys%w(:)*sys%w(:)*conjg(ost%h(i,:))*ost%h(j,:) ) &
-!					+ (ost%bigW_h(i,j))**2 &
-!					+ 0.25_rl*(-ost%bigL_h(i,j))**2 &
-!					- 0.5_rl*sum( (-sys%g(:))*sys%w(:)*(conjg(ost%h(i,:)) + ost%h(j,:)) ) &
-!					- (-ost%bigL_h(i,j))*ost%bigW_h(i,j) ) &
-!					+ sys%del*conjg(ost%q(i))*ost%p(j)*ost%ov_hf(i,j)*sum( sys%w(:)*conjg(ost%h(i,:))*ost%f(j,:) )
-!
-!				tmp4 = tmp4 + conjg(ost%q(j))*ost%ov_hh(j,i)*( &
-!					+ oqdd(i) &
-!					- ost%qdot(i)*( ohh(i,i) + conjg(ohh(i,i)) - 2_rl*conjg(ohh(i,j)) ) &
-!					- 0.5_rl*ost%q(i)*( sum( 2_rl*real(conjg(ohdd(i,:))*ost%h(i,:)) &
-!					+ 2_rl*conjg(ost%hdot(i,:))*ost%hdot(i,:) &
-!					- 2_rl*ohdd(i,:)*conjg(ost%h(j,:)) ) ) &
-!					+ 0.25_rl*ost%q(i)*( ohh(i,i) + conjg(ohh(i,i)) - 2_rl*conjg(ohh(i,j)) )**2 &
-!					)
-!
-!			end do
-!		end do
-!
-!		error_OLD =  -0.5_rl*real(tmp4) + 0.5_rl*tmp1 - 2._rl*aimag(tmp2) + tmp3
-!
-!	END FUNCTION	
-
-!
-!	!-- Calculate the state derivatives form the st variables
-!	SUBROUTINE calcDerivatives_OLD(sys,st) 
-!		type(param), intent(in)                            		::  sys
-!		type(state), intent(in out)	                      		::  st
-!		complex(cx), dimension(st%np)							 		::  bigP, bigQ, v_p, v_q
-!		complex(cx), dimension(st%np,sys%nmode)				 		::  bigF, bigH, v_f, v_h
-!		complex(cx), dimension(st%np,st%np)              		::  M_p, M_q, M_pi, M_qi,N_p, N_q, N_pi, N_qi
-!		complex(cx), dimension(st%np,st%np,st%np)       		::  A_p, A_q
-!		complex(cx), dimension(st%np,st%np,st%np,sys%nmode)  ::  A_f, A_h
-!		real(rl), dimension(2*st%np**2,2*st%np**2)   	 		::  EqMat_p, EqMat_q
-!		real(rl), dimension(2*st%np**2)    		 			 		::  EqRhs_p, EqRhs_q, kappaVec_p, kappaVec_q
-!		real(rl), dimension(st%np,st%np)	   				 		::  Kappa_p_r,Kappa_q_r,kappa_p_c,kappa_q_c
-!		complex(cx), dimension(st%np,st%np)					 		::  Kappa_p,Kappa_q  !-- FINAL KAPPA MATRICES
-!		complex(cx),dimension(st%np,sys%nmode)  			 		::  f,h,fc,hc  		
-!		complex(cx),dimension(st%np)			   			 		::  p,q,pc,qc
-!		complex(cx),dimension(st%np)			   			 		::  der_E_pc_save,der_E_qc_save
-!		complex(cx),dimension(st%np,sys%nmode)			   	::  der_E_fc_save,der_E_hc_save
-!		integer												          		::  i,j,k,l,m,cj,ii,jj,np,info,s
-!
-!		complex(cx), dimension(st%np) 				          		::  tmpV1_p,tmpV1_q,tmpV2_p,tmpV2_q
-!		complex(cx), dimension(st%np,st%np,st%np,sys%nmode) 	::  tmpA_f1,tmpA_h1,tmpA_f2,tmpA_h2
-!		complex(cx), dimension(st%np,sys%nmode) 				   ::  tmpV1_f,tmpV1_h
-!		complex(cx), dimension(st%np,st%np,st%np,st%np)		::  D_f,D_h
-!		complex(cx), dimension(st%np,st%np,st%np)				::  E_f,E_h
-!		complex(cx), dimension(st%np,st%np)						::  K_f,K_h
-!
-!
-!		!-- A few shortcuts
-!		f=st%f;h=st%h;p=st%p;q=st%q
-!		fc=conjg(f);hc=conjg(h);pc=conjg(p);qc=conjg(q)
-!		np = st%np
-!
-!		!- set all variables to zero
-!		bigP = 0._cx;bigQ = 0._cx;bigF = 0._cx;bigH = 0._cx
-!		M_p=0._cx;M_q=0._cx;N_p=0._cx;N_q=0._cx
-!		M_pi=0._cx;M_qi=0._cx;N_pi=0._cx;N_qi=0._cx
-!		A_p=0._cx;A_q=0._cx;A_f=0._cx;A_h=0._cx
-!		eqMat_p=0._cx;eqMat_q=0._cx;eqrhs_p=0._cx;eqrhs_q=0._cx
-!		eqRhs_p = 0._cx;eqRhs_q = 0._cx
-!		v_p=0._cx;v_q=0._cx;v_f=0._cx;v_h=0._cx
-!		Kappa_p_r=0._cx;Kappa_q_r=0._cx;kappa_p_c=0._cx;kappa_q_c=0._cx
-!		kappaVec_p=0._cx; kappaVec_q=0._cx;Kappa_p=0._cx;Kappa_q=0._cx
-!		der_E_fc_save(:,:) = 0._cx
-!		der_E_hc_save(:,:) = 0._cx
-!		der_E_pc_save(:) = 0._cx
-!		der_E_qc_save(:) = 0._cx
-!		D_f = 0._cx;D_h = 0._cx
-!		E_f = 0._cx;E_h = 0._cx
-!		K_f = 0._cx;K_h = 0._cx
-!
-!		!==================================================
-!		!-- STEP 1: Computation of A_p,A_q and v_p,v_q
-!		!-- pDot(i) = sum_(j,k) [ A_p(i,j,k)*Kappa(k,j) + v_p(i) ] 
-!		!-- qDot(i) = sum_(j,k) [ A_q(i,j,k)*Kappa(k,j) + v_q(i) ] 
-!
-!		do i=1,np
-!			bigP(i) = P_j(sys,st,i)
-!			bigQ(i) = Q_j(sys,st,i)
-!			bigF(i,:) =  F_j(sys,st,i) 
-!			bigH(i,:) =  H_j(sys,st,i) 
-!		end do
-!
-!		!-- Matrix M: to be inverted
-!		M_p = st%ov_ff
-!		M_q = st%ov_hh
-!
-!		!-- perform the inversion
-!		M_pi = M_p
-!		M_qi = M_q
-!		CALL invertH(M_pi,info)
-!		CALL invertH(M_qi,info)
-!
-!		!-- Define v_p, v_q and A_p, A_q
-!		v_p = M_pi .matprod. bigP
-!		v_q = M_qi .matprod. bigQ
-!
-!		do i=1,size(A_p,1)
-!			do j=1,size(A_p,2)
-!				do k=1,size(A_p,3)
-!					A_p(i,j,k) = 0.5_rl* M_pi(i,j) * st%ov_ff(j,k) * p(k)
-!					A_q(i,j,k) = 0.5_rl* M_qi(i,j) * st%ov_hh(j,k) * q(k)
-!				end do
-!			end do
-!		end do
-!
-!
-!		!==================================================
-!		!-- STEP 2: Computation of A_f,A_h and v_f,v_h
-!		!-- fDot(i) = sum_(j,k) [ A_f(i,j,k)*Kappa(k,j) ] + v_f(i)  
-!		!-- hDot(i) = sum_(j,k) [ A_h(i,j,k)*Kappa(k,j) ] + v_h(i)  
-!
-!		do j=1,np
-!			do m=1,np
-!				N_p(j,m) = p(m)*st%ov_ff(j,m)
-!				N_q(j,m) = q(m)*st%ov_hh(j,m) 
-!			end do
-!		end do
-!
-!		!-- Calculate Nij and is inverse
-!		N_pi = N_p
-!		N_qi = N_q
-!		CALL invertGeneral(N_pi,info)
-!		CALL invertGeneral(N_qi,info)
-!
-!
-!		!-- Computation of v_f and v_h (H_i in the notes)
-!		tmpV1_f=0._cx
-!		tmpV1_h=0._cx
-!
-!		!-- First term of v_f (and v_h)
-!		tmpV1_f = bigF
-!		tmpV1_h = bigH
-!		!-- Second term of v_f
-!		do s=1,sys%nmode
-!			do j=1,np
-!				tmpV1_f(j,s) = tmpV1_f(j,s) &
-!					- sum( st%ov_ff(j,:)*v_p(:)*f(:,s) )
-!				tmpV1_h(j,s) = tmpV1_h(j,s) &
-!					- sum( st%ov_hh(j,:)*v_q(:)*h(:,s) )
-!			end do
-!			v_f(:,s) = N_pi .matprod. tmpV1_f(:,s)
-!			v_h(:,s) = N_qi .matprod. tmpV1_h(:,s)
-!		end do
-!
-!		tmpA_f1=0._cx; tmpA_h1=0._cx
-!		tmpA_f2=0._cx; tmpA_h2=0._cx
-!
-!		!-- Defining the Betref matrices, here designated by A_f and A_h
-!
-!		do s=1,sys%nmode
-!			do k=1,size(A_f,2)
-!				do j=1,size(A_f,3)
-!
-!					do i=1,size(A_f,1)
-!						tmpA_f1(i,j,k,s) = 0.5_rl* N_pi(i,j) * p(k)*f(k,s) * st%ov_ff(j,k)
-!						tmpA_h1(i,j,k,s) = 0.5_rl* N_qi(i,j) * q(k)*h(k,s) * st%ov_hh(j,k)
-!					end do
-!
-!					do l=1,np
-!						tmpA_f2(l,j,k,s) = tmpA_f2(l,j,k,s) & 
-!							- sum( A_p(:,j,k)*f(:,s)*st%ov_ff(l,:) )
-!						tmpA_h2(l,j,k,s) = tmpA_h2(l,j,k,s) &
-!							- sum( A_q(:,j,k)*h(:,s)*st%ov_hh(l,:) )
-!					end do
-!
-!				end do
-!
-!
-!				A_f(:,:,k,s) = tmpA_f1(:,:,k,s) + ( N_pi .matprod. tmpA_f2(:,:,k,s) )
-!				A_h(:,:,k,s) = tmpA_h1(:,:,k,s) + ( N_qi .matprod. tmpA_h2(:,:,k,s) )
-!
-!			end do
-!		end do
-!
-!		!==================================================
-!		!-- STEP 3: Solve the system of equations for Kappa
-!		!-- Define Q_ij, a 2*np**2 matrix: j in [1,np**2] correpsonds to Re(kappa)
-!		!--    while j in [1+np**2,2*np**2] corresponds to Im(Kappa)
-!
-!		cj = st%np**2   !-- a shortcut to get to the imagainary part of kappaVec
-!
-!		do i=1,st%np
-!			do j=1,st%np
-!				K_f(i,j) = sum( conjg(f(i,:))*v_f(i,:) + f(i,:)*conjg(v_f(i,:)) - 2._rl*conjg(f(j,:))*v_f(i,:) )
-!				K_h(i,j) = sum( conjg(h(i,:))*v_h(i,:) + h(i,:)*conjg(v_h(i,:)) - 2._rl*conjg(h(j,:))*v_h(i,:) )
-!				do k=1,st%np
-!					E_f(i,j,k) = sum( f(i,:)*conjg(A_f(i,j,k,:))  )
-!					E_h(i,j,k) = sum( h(i,:)*conjg(A_h(i,j,k,:))  )
-!					do m=1,st%np
-!						D_f(i,m,j,k) = sum( (conjg(f(i,:)) - 2._rl*conjg(f(m,:)))*A_f(i,j,k,:) )
-!						D_h(i,m,j,k) = sum( (conjg(h(i,:)) - 2._rl*conjg(h(m,:)))*A_h(i,j,k,:) )
-!					end do
-!				end do
-!			end do
-!		end do
-!
-!
-!		do i=1, np
-!			do m=1, np
-!
-!				ii = np*(i-1)+m
-!
-!				eqRhs_p(ii) 	  =  real( K_f(i,m) )
-!				eqRhs_q(ii) 	  =  real( K_h(i,m) )
-!				eqRhs_p(ii+cj)  =  aimag( K_f(i,m) )
-!				eqRhs_q(ii+cj)  =  aimag( K_h(i,m) )
-!
-!				do j=1, np
-!					do k=1, np
-!
-!						jj = np*(k-1) + j
-!
-!						eqMat_p(ii,jj) = kroneckerDelta(ii,jj) - real(  D_f(i,m,j,k) + E_f(i,j,k) )
-!						eqMat_p(ii,jj+cj) = kroneckerDelta(ii,jj+cj) + aimag(  D_f(i,m,j,k) - E_f(i,j,k) )
-!						eqMat_p(ii+cj,jj) = kroneckerDelta(ii+cj,jj) - aimag(  D_f(i,m,j,k) + E_f(i,j,k) )
-!						eqMat_p(ii+cj,jj+cj) = kroneckerDelta(ii+cj,jj+cj) - real(  D_f(i,m,j,k) - E_f(i,j,k) )
-!
-!						eqMat_q(ii,jj) = kroneckerDelta(ii,jj) - real(  D_h(i,m,j,k) + E_h(i,j,k) )
-!						eqMat_q(ii,jj+cj) = kroneckerDelta(ii,jj+cj) + aimag(  D_h(i,m,j,k) - E_h(i,j,k) )
-!						eqMat_q(ii+cj,jj) = kroneckerDelta(ii+cj,jj) - aimag(  D_h(i,m,j,k) + E_h(i,j,k) )
-!						eqMat_q(ii+cj,jj+cj) = kroneckerDelta(ii+cj,jj+cj) - real(  D_h(i,m,j,k) - E_h(i,j,k) )
-!
-!					end do
-!				end do
-!			end do
-!		end do
-!
-!
-!		!-- Apply the Lapack algorithm to solve the real system of equations
-!		!-- the solution replaces the 2nd argument
-!		kappaVec_p = eqRhs_p
-!		CALL solveEq_r(eqMat_p,kappaVec_p)
-!		kappaVec_q = eqRhs_q
-!		CALL solveEq_r(eqMat_q,kappaVec_q)
-!
-!
-!		! Convert the matrices to np*np matrix
-!		kappa_p_r = transpose(reshape(kappaVec_p(1:np**2),(/np,np/)) )
-!		kappa_p_c = transpose(reshape(kappaVec_p(1+np**2:2*np**2),(/np,np/)) )
-!		kappa_q_r = transpose(reshape(kappaVec_q(1:np**2),(/np,np/)) )
-!		kappa_q_c = transpose(reshape(kappaVec_q(1+np**2:2*np**2),(/np,np/)) )
-!
-!		kappa_p = kappa_p_r + Ic * kappa_p_c
-!		kappa_q = kappa_q_r + Ic * kappa_q_c
-!
-!		!-- Compute the pdots and qdots
-!		!-- pdot(i) = sum_j,k 0.5*M_pi(i,j)*ov(f(j),f(k))*p(k)*Kappa_p(k,j) + v_p(i)
-!
-!		tmpV1_p=0._rl;tmpV2_p=0._rl
-!		tmpV1_q=0._rl;tmpV2_q=0._rl
-!		do j=1,np
-!			tmpV1_p(j)=tmpV1_p(j) + 0.5_rl*sum( p(:)*st%ov_ff(j,:)*Kappa_p(:,j) )
-!			tmpV1_q(j)=tmpV1_q(j) + 0.5_rl*sum( q(:)*st%ov_hh(j,:)*Kappa_q(:,j) )
-!		end do
-!
-!		tmpV2_p = M_pi .matprod. tmpV1_p
-!		tmpV2_q = M_qi .matprod. tmpV1_q
-!
-!		st%pdot = tmpV2_p + v_p
-!		st%qdot = tmpV2_q + v_q
-!
-!
-!		!-- Compute the fdots and hdots
-!		!-- fdot(i) = sum_j,k [ -N_pi(i,j)*p(k)*Kappa_p(k,j)*pc(j)*f(k)*ov(f(j),f(k)) 
-!		!								+ sum_l,m [ -N_pi(i,l)*A_p(m,j,k)*Kappa_p(k,j)*pc(l)f(m)*ov(f(l),f(m)) ] ] + v_f(i)
-!		tmpV1_f=0._cx
-!		tmpV1_h=0._cx
-!
-!		do s=1, sys%nmode
-!			do i=1,np
-!				do j=1,np
-!					tmpV1_f(i,s) = tmpV1_f(i,s) + sum( A_f(i,j,:,s) * Kappa_p(:,j) )
-!					tmpV1_h(i,s) = tmpV1_h(i,s) + sum( A_h(i,j,:,s) * Kappa_q(:,j) )
-!				end do
-!			end do
-!		end do
-!
-!		st%fdot = tmpV1_f + v_f
-!		st%hdot = tmpV1_h + v_h
-!	END SUBROUTINE calcDerivatives_OLD
